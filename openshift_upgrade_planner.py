@@ -213,10 +213,10 @@ class OpenShiftUpgradePlanner:
             target_parts = [int(x) for x in target_ver.split(".")[:2]]
             
             if curr_parts[0] == target_parts[0]:
-                hops = []
-                major = curr_parts[0]
-                for minor in range(curr_parts[1], target_parts[1] + 1):
-                    hops.append(f"{major}.{minor}.z")
+                hops = [curr_ver]
+                for minor in range(curr_parts[1] + 1, target_parts[1]):
+                    hops.append(f"{curr_parts[0]}.{minor}.z")
+                hops.append(target_ver)
                 if len(hops) > 1:
                     self.report_data["upgrade_path"] = hops
                     print(f"Airgapped fallback upgrade path: {' -> '.join(hops)}")
@@ -636,6 +636,8 @@ class OpenShiftUpgradePlanner:
     def analyze_addon_operators(self):
         print("Analyzing Addon CSV Operators & Compatibility matrices...")
         csvs = []
+        seen_names = set()  # Deduplicate by CSV name
+        
         if self.is_must_gather:
             ns_dir = os.path.join(self.output_dir, "namespaces")
             if os.path.exists(ns_dir):
@@ -646,12 +648,15 @@ class OpenShiftUpgradePlanner:
                             if filename.endswith(".yaml"):
                                 data = self.load_yaml(os.path.join(csv_path, filename))
                                 if data:
-                                    csvs.append({
-                                        "name": data.get("metadata", {}).get("name", "Unknown"),
-                                        "namespace": ns,
-                                        "phase": data.get("status", {}).get("phase", "Unknown"),
-                                        "raw_data": data
-                                    })
+                                    name = data.get("metadata", {}).get("name", "Unknown")
+                                    if name not in seen_names:
+                                        seen_names.add(name)
+                                        csvs.append({
+                                            "name": name,
+                                            "namespace": ns,
+                                            "phase": data.get("status", {}).get("phase", "Unknown"),
+                                            "raw_data": data
+                                        })
         else:
             path = f"{self.output_dir}/csv.json"
             if os.path.exists(path):
@@ -660,12 +665,15 @@ class OpenShiftUpgradePlanner:
                         data = json.load(f)
                         items = data.get("items", []) if isinstance(data, dict) else data
                         for item in items:
-                            csvs.append({
-                                "name": item["metadata"]["name"],
-                                "namespace": item["metadata"]["namespace"],
-                                "phase": item.get("status", {}).get("phase", "Unknown"),
-                                "raw_data": item
-                            })
+                            name = item["metadata"]["name"]
+                            if name not in seen_names:
+                                seen_names.add(name)
+                                csvs.append({
+                                    "name": name,
+                                    "namespace": item["metadata"]["namespace"],
+                                    "phase": item.get("status", {}).get("phase", "Unknown"),
+                                    "raw_data": item
+                                })
                     except Exception:  # nosec B110
                         pass
 
