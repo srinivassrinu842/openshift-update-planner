@@ -16,7 +16,6 @@ except ImportError:
     HAS_YAML = False
 
 class OpenShiftUpgradePlanner:
-    # Static fallbacks for primary operators, but we now check all operators dynamically
     COMPATIBILITY_MATRICES = {
         "ocs-operator": { # Red Hat OpenShift Data Foundation (ODF)
             "4.10": ["4.10"], "4.11": ["4.11"], "4.12": ["4.12"],
@@ -380,7 +379,7 @@ class OpenShiftUpgradePlanner:
         # Certificates
         certs_cmd = (
             "oc get secrets -A -o json | jq -r '.items | sort_by(.metadata.namespace,.metadata.name) |.[] |"
-            "select((.type == \"kubernetes.io/tls\") or (.type == \"SecretTypeTLS\"))| \"\\(.metadata.namespace) \\(.metadata.name) \\(.data | to_entries[] | select(.key | test(\"key\") or test(\"Key\") | not)| .value)\"' | "
+            "select((.type == \"kubernetes.io/tls\") or (.type == \"SecretTypeTLS\") or (.data | has(\"tls.crt\")))| \"\\(.metadata.namespace) \\(.metadata.name) \\(.data | to_entries[] | select(.key | test(\"key\") or test(\"Key\") | not)| .value)\"' | "
             "while read namespace name cert; do echo -e \"\\n${namespace} - ${name}\\n##################################################\"; "
             "echo $cert | base64 -d | openssl crl2pkcs7 -nocrl -certfile /dev/stdin | openssl pkcs7 -print_certs -text -noout | grep -A4 Issuer:; "
             f"done > {self.output_dir}/certs.out"
@@ -388,8 +387,7 @@ class OpenShiftUpgradePlanner:
         self.run_cmd(certs_cmd)
         
         certs2_cmd = (
-            "(echo -e \"NAMESPACE\\tNAME\\tEXPIRY\" && oc get secrets -A -o go-template='"
-            "{{range .items}}{{if eq .type \"kubernetes.io/tls\"}}{{.metadata.namespace}}{\" \"}}{{.metadata.name}}{\" \"}}{{index .data \"tls.crt\"}}{\"\\n\"}}{{end}}{{end}}' | "
+            "(echo -e \"NAMESPACE\\tNAME\\tEXPIRY\" && oc get secrets -A -o json | jq -r '.items[] | select(.data | has(\"tls.crt\")) | \"\\(.metadata.namespace)\\t\\(.metadata.name)\\t\\(.data[\"tls.crt\"])\"' | "
             "while read namespace name cert; do echo -en \"$namespace\\t$name\\t\"; echo $cert | base64 -d | openssl x509 -noout -enddate; "
             f"done ) | column -t > {self.output_dir}/certs2.out"
         )
@@ -569,11 +567,10 @@ class OpenShiftUpgradePlanner:
                                 "name": name,
                                 "role": "node",
                                 "ready": ready,
-                                "unschedulable": data.get("spec", {}).get("unschedulable", False)
+                                "unschedulable": data.get("spec", {}).get("unschedulable", False),
+                                "cpu_req": "Unknown",
+                                "mem_req": "Unknown"
                             })
-                            if ready != "True":
-                                self.report_data["overall_status"] = "FAIL"
-                                self.report_data["errors"].append(f"Node '{name}' in must-gather is not Ready.")
             return
 
         path = f"{self.output_dir}/nodes.json"
@@ -588,14 +585,32 @@ class OpenShiftUpgradePlanner:
                     for cond in item.get("status", {}).get("conditions", []):
                         if cond["type"] == "Ready":
                             ready = cond["status"]
+                    
+                    cpu_req, mem_req = self._parse_node_resources(name)
                     self.report_data["nodes"].append({
                         "name": name,
                         "role": "node",
                         "ready": ready,
-                        "unschedulable": item.get("spec", {}).get("unschedulable", False)
+                        "unschedulable": item.get("spec", {}).get("unschedulable", False),
+                        "cpu_req": cpu_req,
+                        "mem_req": mem_req
                     })
             except Exception:  # nosec B110
                 pass
+
+    def _parse_node_resources(self, node_name):
+        path = f"{self.output_dir}/{node_name}.info"
+        cpu_req, mem_req = "Unknown", "Unknown"
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                content = f.read()
+                cpu_match = re.search(r"cpu\s+[\d\w\.]+\s+\((\d+)%\)", content)
+                if cpu_match:
+                    cpu_req = f"{cpu_match.group(1)}%"
+                mem_match = re.search(r"memory\s+[\d\w\.]+\s+\((\d+)%\)", content)
+                if mem_match:
+                    mem_req = f"{mem_match.group(1)}%"
+        return cpu_req, mem_req
 
     def analyze_pods(self):
         print("Analyzing pods...")
@@ -759,6 +774,27 @@ class OpenShiftUpgradePlanner:
                             f"Recommendation: Upgrade {package_name} to version {recommended_version} prior to OCP upgrade."
                         )
 
+    def analyze_subscriptions(self):
+        print("Analyzing OLM Subscriptions...")
+        path = f"{self.output_dir}/subs-all.out"
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                for line in f.readlines()[1:]:
+                    parts = line.strip().split()
+                    if len(parts) >= 3:
+                        ns, name, package = parts[0], parts[1], parts[2]
+                        # In standard OLM, subscription health is determined by installplan state or catalog connection
+                        # We parse if there are warnings or errors
+                        state = parts[-1] if len(parts) > 3 else "Unknown"
+                        if state in ["UpgradePending", "UpgradeFailed", "Blocked"]:
+                            self.report_data["failed_subscriptions"].append({
+                                "namespace": ns,
+                                "name": name,
+                                "state": state
+                            })
+                            self.report_data["overall_status"] = "FAIL"
+                            self.report_data["errors"].append(f"Subscription '{name}' in namespace '{ns}' is in state {state}.")
+
     def analyze_deprecated_apis(self):
         if self.is_must_gather:
             return
@@ -810,6 +846,15 @@ class OpenShiftUpgradePlanner:
                     self.report_data["current_version"] = history[0].get("version", "Unknown")
         except Exception:  # nosec B110
             pass
+
+    def analyze_warnings_and_events(self):
+        print("Parsing warning events...")
+        path = f"{self.output_dir}/events-all.out"
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                for line in f.readlines():
+                    if "warning" in line.lower():
+                        self.report_data["warnings_and_events"].append(line.strip())
 
     def generate_markdown_report(self):
         report_path = "upgrade_readiness_report.md"
@@ -879,12 +924,12 @@ The planner cross-referenced your OLM operators against OpenShift target version
             md += f"| `{mcp['name']}` | `{mcp['paused']}` | `{mcp['degraded']}` | {mcp_status} |\n"
 
         md += """
-### 4. Node Health
-| Node Name | Role | Ready | Schedulable |
-|---|---|---|---|
+### 4. Node Health & Capacity Buffer
+| Node Name | Role | Ready | Schedulable | CPU Request | Memory Request |
+|---|---|---|---|---|---|
 """
         for node in self.report_data["nodes"]:
-            md += f"| `{node['name']}` | `{node['role']}` | `{node['ready']}` | `{not node['unschedulable']}` |\n"
+            md += f"| `{node['name']}` | `{node['role']}` | `{node['ready']}` | `{not node['unschedulable']}` | `{node.get('cpu_req', 'Unknown')}` | `{node.get('mem_req', 'Unknown')}` |\n"
 
         md += """
 ### 5. Pod Failures & Evictions
@@ -902,13 +947,23 @@ The planner cross-referenced your OLM operators against OpenShift target version
 """
         if self.report_data["expiring_certificates"]:
             md += "| Namespace | Secret Name | Expiry Date | Days Remaining |\n|---|---|---|---|\n"
-            # Sort by days remaining (ascending) to show soonest expiring first
             sorted_certs = sorted(self.report_data["expiring_certificates"], key=lambda k: k.get("days_remaining", 9999))
-            for cert in sorted_certs[:25]:  # List top 25 soonest expiring certificates
+            for cert in sorted_certs[:25]:
                 day_status = "🟢 OK" if cert['days_remaining'] > 30 else "🔴 ACTION REQUIRED"
                 md += f"| `{cert['namespace']}` | `{cert['name']}` | `{cert['expiry']}` | `{cert['days_remaining']}` days ({day_status}) |\n"
         else:
             md += "*No expiring certificates parsed from secret dumps.*"
+
+        md += """
+
+### 7. Active Warning Events
+"""
+        if self.report_data["warnings_and_events"]:
+            md += "| Warning Event Snippet |\n|---|\n"
+            for event in self.report_data["warnings_and_events"][:15]:
+                md += f"| `{event}` |\n"
+        else:
+            md += "*No warning events parsed from event logs.*"
 
         md += "\n--- \n\n## Warnings & Critical Blockers\n"
         if self.report_data["errors"]:
@@ -938,8 +993,10 @@ The planner cross-referenced your OLM operators against OpenShift target version
         self.analyze_nodes()
         self.analyze_pods()
         self.analyze_addon_operators()
+        self.analyze_subscriptions()
         self.analyze_deprecated_apis()
         self.analyze_certificates()
+        self.analyze_warnings_and_events()
         self.run_known_issues_analysis()
         self.generate_markdown_report()
 
