@@ -134,6 +134,17 @@ class OpenShiftUpgradePlanner:
         except Exception as e:
             return {"success": False, "error": str(e), "output": ""}
 
+    def check_oc_connection(self):
+        """Verifies if there is a valid connection/active login to the OpenShift cluster."""
+        if self.mode == "offline":
+            return
+        print("Checking active connection to OpenShift cluster...")
+        res = self.run_cmd("oc whoami")
+        if not res["success"]:
+            print(f"Error: Unable to connect to the OpenShift cluster. Please login first (e.g. 'oc login'). Detail: {res.get('error')}")
+            sys.exit(1)
+        print(f"Connected to cluster as user: {res['output'].strip()}")
+
     def ask_credentials_and_proxy(self):
         """Asks user if proxy or specific credentials are required for connection."""
         if self.mode == "offline":
