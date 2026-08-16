@@ -67,6 +67,7 @@ class OpenShiftUpgradePlanner:
             "upgrade_path": [],
             "etcd_health": "Unknown",
             "etcd_alarms": "None",
+            "etcd_members": [],
             "cluster_operators": [],
             "machine_config_pools": [],
             "nodes": [],
@@ -77,8 +78,10 @@ class OpenShiftUpgradePlanner:
             "deprecated_apis_in_use": [],
             "expiring_certificates": [],
             "warnings_and_events": [],
+            "catalogsources": [],
             "overall_status": "PASS",
-            "errors": []
+            "errors": [],
+            "remediations": []
         }
 
     def load_yaml(self, path):
@@ -295,6 +298,9 @@ class OpenShiftUpgradePlanner:
         self.run_cmd(f"oc get pod -A > {self.output_dir}/pods-all.out")
         self.run_cmd(f"oc get subs -A > {self.output_dir}/subs-all.out")
         self.run_cmd(f"oc get events -A > {self.output_dir}/events-all.out")
+        self.run_cmd(f"oc get catalogsource -A -o json > {self.output_dir}/catalogsource.json")
+        self.run_cmd(f"oc get operatorgroup -A -o json > {self.output_dir}/operatorgroup.json")
+        self.run_cmd(f"oc get installplan -A -o json > {self.output_dir}/installplan.json")
         
         nodes_res = self.run_cmd("oc get nodes -o jsonpath='{.items[*].metadata.name}'")
         if nodes_res["success"]:
@@ -410,8 +416,16 @@ class OpenShiftUpgradePlanner:
                 self.report_data["etcd_health"] = "DEGRADED"
                 self.report_data["overall_status"] = "FAIL"
                 self.report_data["errors"].append("etcd reports unhealthy endpoints in etcdctl health check.")
+                self.report_data["remediations"].append(
+                    "Fix etcd transport/network errors or replace degraded control-plane members before proceeding. Reference: https://access.redhat.com/solutions/4890691"
+                )
             else:
                 self.report_data["etcd_health"] = "HEALTHY"
+
+            # Parse members
+            for line in content.splitlines():
+                if "db size" in line.lower() or "member" in line.lower() or "started" in line.lower():
+                    self.report_data["etcd_members"].append(line.strip())
 
             alarm_idx = content.find("alarm list")
             if alarm_idx != -1:
@@ -420,6 +434,7 @@ class OpenShiftUpgradePlanner:
                     self.report_data["etcd_alarms"] = ", ".join(active_alarms)
                     self.report_data["overall_status"] = "FAIL"
                     self.report_data["errors"].append(f"etcd has active alarms: {active_alarms}")
+                    self.report_data["remediations"].append("Defragment etcd member endpoints and clear alarms: `etcdctl alarm disarm`. Reference: https://access.redhat.com/solutions/5086881")
 
     def analyze_cluster_operators(self):
         print("Analyzing Cluster Operators...")
@@ -464,6 +479,9 @@ class OpenShiftUpgradePlanner:
                     if not status_ok:
                         self.report_data["overall_status"] = "FAIL"
                         self.report_data["errors"].append(f"Cluster Operator '{name}' is degraded/unstable.")
+                        self.report_data["remediations"].append(
+                            f"Investigate operator '{name}' status: `oc describe co {name}`. Do not attempt upgrades while operators are degraded."
+                        )
             except Exception as e:
                 self.report_data["errors"].append(f"Error parsing co.json: {str(e)}")
 
@@ -525,6 +543,9 @@ class OpenShiftUpgradePlanner:
                     if degraded:
                         self.report_data["overall_status"] = "FAIL"
                         self.report_data["errors"].append(f"MachineConfigPool '{name}' is degraded.")
+                        self.report_data["remediations"].append(
+                            f"Check MachineConfigPool events: `oc describe mcp {name}`. Inspect failing MachineConfigs using `oc get mc`."
+                        )
             except Exception:  # nosec B110
                 pass
 
@@ -598,6 +619,31 @@ class OpenShiftUpgradePlanner:
             except Exception:  # nosec B110
                 pass
 
+        # Validate Capacity Headroom / Absorbability during Node drain
+        self._validate_cluster_resource_headroom()
+
+    def _validate_cluster_resource_headroom(self):
+        """Calculates if the cluster has enough resource buffer to absorb a single control plane/worker node drain during upgrades."""
+        masters = [n for n in self.report_data["nodes"] if "master" in n["name"]]
+        if len(masters) == 3:
+            # Check master nodes requests
+            high_request = False
+            for m in masters:
+                try:
+                    cpu_pct = int(m["cpu_req"].replace("%", ""))
+                    mem_pct = int(m["mem_req"].replace("%", ""))
+                    if cpu_pct > 70 or mem_pct > 70:
+                        high_request = True
+                except ValueError:
+                    pass
+
+            if high_request:
+                self.report_data["overall_status"] = "FAIL"
+                self.report_data["errors"].append("Control plane memory/CPU request levels exceed 70% threshold. Draining a control-plane member will exhaust the remaining master nodes' resources.")
+                self.report_data["remediations"].append(
+                    "Reduce resource request limits of active management workloads or scale up the master node hardware specifications to allow a safe node upgrade buffer."
+                )
+
     def _parse_node_resources(self, node_name):
         path = f"{self.output_dir}/{node_name}.info"
         cpu_req, mem_req = "Unknown", "Unknown"
@@ -641,7 +687,7 @@ class OpenShiftUpgradePlanner:
                     parts = line.strip().split()
                     if len(parts) >= 3:
                         ns, name, status = parts[0], parts[1], parts[2]
-                        if status not in ["Running", "Completed", "Succeeded", "Terminating"]:
+                        if status not in ["Running", "Completed", "Succeeded", "Terminating"] and "1/" not in status and "2/" not in status and "3/" not in status:
                             self.report_data["unhealthy_pods"].append({
                                 "namespace": ns,
                                 "name": name,
@@ -783,8 +829,6 @@ class OpenShiftUpgradePlanner:
                     parts = line.strip().split()
                     if len(parts) >= 3:
                         ns, name, package = parts[0], parts[1], parts[2]
-                        # In standard OLM, subscription health is determined by installplan state or catalog connection
-                        # We parse if there are warnings or errors
                         state = parts[-1] if len(parts) > 3 else "Unknown"
                         if state in ["UpgradePending", "UpgradeFailed", "Blocked"]:
                             self.report_data["failed_subscriptions"].append({
@@ -831,6 +875,14 @@ class OpenShiftUpgradePlanner:
                                 "expiry": expiry_str,
                                 "days_remaining": days_remaining
                             })
+                            # Trigger blocker if less than 30 days remaining
+                            if days_remaining <= 30:
+                                self.report_data["overall_status"] = "FAIL"
+                                self.report_data["errors"].append(f"Certificate secret '{name}' in namespace '{ns}' expires in {days_remaining} days.")
+                                if "kube-controller" in name or "kube-scheduler" in name or "apiserver" in name:
+                                    self.report_data["remediations"].append(
+                                        f"Manually force rotation of expired/expiring API control plane client certs: `oc patch kubeapiserver cluster --type=merge -p '{{\"spec\": {{\"forceRedeploymentReason\": \"manual-rotation-{datetime.now().strftime('%s')}\"}}}}'`"
+                                    )
                         except Exception:  # nosec B110
                             pass
 
@@ -848,13 +900,21 @@ class OpenShiftUpgradePlanner:
             pass
 
     def analyze_warnings_and_events(self):
-        print("Parsing warning events...")
+        print("Parsing warning events & OLM errors...")
         path = f"{self.output_dir}/events-all.out"
         if os.path.exists(path):
             with open(path, "r") as f:
                 for line in f.readlines():
                     if "warning" in line.lower():
                         self.report_data["warnings_and_events"].append(line.strip())
+                        # Check for OLM connection and satisfy constraint errors
+                        if "resolutionfailed" in line.lower() or "connection refused" in line.lower():
+                            if "ResolutionFailed" not in [x.get("type") for x in self.report_data["failed_subscriptions"]]:
+                                self.report_data["overall_status"] = "FAIL"
+                                self.report_data["errors"].append(f"OLM CatalogSource/Subscription resolution failure detected: {line.strip()[:120]}...")
+                                self.report_data["remediations"].append(
+                                    "Fix offline CatalogSource connection refused issues. Check catalog registry pod logs in openshift-marketplace namespace."
+                                )
 
     def generate_markdown_report(self):
         report_path = "upgrade_readiness_report.md"
@@ -965,12 +1025,30 @@ The planner cross-referenced your OLM operators against OpenShift target version
         else:
             md += "*No warning events parsed from event logs.*"
 
+        md += """
+
+### 8. etcd Cluster Details
+"""
+        if self.report_data["etcd_members"]:
+            md += "| Member Endpoint Details / DB Sizes |\n|---|\n"
+            for m in self.report_data["etcd_members"]:
+                md += f"| `{m}` |\n"
+        else:
+            md += "*No etcd cluster member logs parsed.*"
+
         md += "\n--- \n\n## Warnings & Critical Blockers\n"
         if self.report_data["errors"]:
             for err in self.report_data["errors"]:
                 md += f"- **BLOCKER:** {err}\n"
         else:
             md += "- **No blockers detected.**\n"
+
+        md += "\n## Red Hat Support Remediation Actions\n"
+        if self.report_data["remediations"]:
+            for rem in self.report_data["remediations"]:
+                md += f"- **REMEDIATION:** {rem}\n"
+        else:
+            md += "- **No remediation steps required.**\n"
             
         with open(report_path, "w") as f:
             f.write(md)
