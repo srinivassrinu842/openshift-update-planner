@@ -5,10 +5,17 @@ import sys
 import os
 import re
 from datetime import datetime
-import yaml  # In standard environments, we can fallback to regex parser if PyYAML is missing
+import urllib.request
+import urllib.parse
+
+# Fallback for YAML parsing if PyYAML is missing
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
 
 class OpenShiftUpgradePlanner:
-    # Static fallbacks for primary operators, but we now check all operators dynamically
     COMPATIBILITY_MATRICES = {
         "ocs-operator": { # Red Hat OpenShift Data Foundation (ODF)
             "4.10": ["4.10"], "4.11": ["4.11"], "4.12": ["4.12"],
@@ -40,16 +47,20 @@ class OpenShiftUpgradePlanner:
         }
     }
 
-    def __init__(self, target_version, output_dir="/tmp/UPGRADE", mode="live"):
+    def __init__(self, target_version, output_dir="/tmp/UPGRADE", mode="live", proxy=None):
         self.target_version = target_version
         self.output_dir = output_dir
-        self.mode = mode.lower()  # 'live' or 'offline'
+        self.mode = mode.lower()
+        self.proxy = proxy
         self.is_must_gather = False
+        self.cluster_channel = "stable-4.13"  # Default fallback
+        self.cluster_arch = "amd64"          # Default fallback
         self.report_data = {
             "timestamp": datetime.now().isoformat(),
             "mode": self.mode,
             "target_version": target_version,
             "current_version": "Unknown",
+            "upgrade_path": [],
             "etcd_health": "Unknown",
             "etcd_alarms": "None",
             "cluster_operators": [],
@@ -70,13 +81,14 @@ class OpenShiftUpgradePlanner:
         if not os.path.exists(path):
             return None
         try:
-            with open(path, 'r') as f:
-                return yaml.safe_load(f)
-        except ImportError:
-            with open(path, 'r') as f:
-                content = f.read()
-            return self._fallback_yaml_parse(content)
-        except Exception as e:
+            if HAS_YAML:
+                with open(path, 'r') as f:
+                    return yaml.safe_load(f)
+            else:
+                with open(path, 'r') as f:
+                    content = f.read()
+                return self._fallback_yaml_parse(content)
+        except Exception:
             return None
 
     def _fallback_yaml_parse(self, content):
@@ -90,7 +102,6 @@ class OpenShiftUpgradePlanner:
         if phase_match:
             status["phase"] = phase_match.group(1)
         
-        # Capture annotations block if simple
         annotations = {}
         ann_matches = re.findall(r"olm\.maxOpenShiftVersion:\s*\"?([\w\-\.]+)\"?", content)
         if ann_matches:
@@ -121,6 +132,107 @@ class OpenShiftUpgradePlanner:
             return {"success": True, "output": result.stdout.strip()}
         except Exception as e:
             return {"success": False, "error": str(e), "output": ""}
+
+    def ask_credentials_and_proxy(self):
+        """Asks user if proxy or specific credentials are required for connection."""
+        if self.mode == "offline":
+            return
+
+        print("\n--- Network & Registry Credentials Check ---")
+        use_proxy = input("Does your environment require a proxy to access public APIs (e.g. Red Hat Upgrade Graph)? (y/N): ").strip().lower()
+        if use_proxy == 'y':
+            self.proxy = input("Enter proxy URL (e.g. http://username:password@proxy.example.com:8080): ").strip()
+            print(f"Proxy set to: {self.proxy}")
+
+        use_pull_secret = input("Do you want to extract and validate the cluster's global registry pull secret? (y/N): ").strip().lower()
+        if use_pull_secret == 'y':
+            print("-> Extracting global pull-secret from openshift-config...")
+            res = self.run_cmd("oc get secret/pull-secret -n openshift-config -o jsonpath='{.data.\\.dockerconfigjson}' | base64 -d")
+            if res["success"]:
+                secret_path = os.path.join(self.output_dir, "extracted-pull-secret.json")
+                with open(secret_path, "w") as f:
+                    f.write(res["output"])
+                print(f"Successfully exported pull-secret to {secret_path}")
+            else:
+                print(f"Failed to extract pull-secret: {res['error']}")
+
+    def query_upgrade_graph(self):
+        """Queries the Red Hat OpenShift Upgrade Graph API dynamically."""
+        print(f"Querying Red Hat Upgrade Graph for path validation (Channel: {self.cluster_channel}, Arch: {self.cluster_arch})...")
+        url = f"https://api.openshift.com/api/upgrades_info/v1/graph?channel={self.cluster_channel}&arch={self.cluster_arch}"
+        
+        try:
+            # Set up proxy handler if proxy is defined
+            if self.proxy:
+                proxy_support = urllib.request.ProxyHandler({'http': self.proxy, 'https': self.proxy})
+                opener = urllib.request.build_opener(proxy_support)
+                urllib.request.install_opener(opener)
+            
+            req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+            with urllib.request.urlopen(req, timeout=15) as response:
+                graph_data = json.loads(response.read().decode('utf-8'))
+                self.calculate_upgrade_path(graph_data)
+        except Exception as e:
+            msg = f"Failed to fetch upgrade graph from Red Hat: {str(e)}"
+            print(f"Warning: {msg}")
+            self.report_data["warnings_and_events"].append(msg)
+
+    def calculate_upgrade_path(self, graph):
+        """Calculates the upgrade path using Breadth-First Search (BFS) on the DAG."""
+        nodes = graph.get("nodes", [])
+        edges = graph.get("edges", [])
+        
+        # Build adjacency list
+        adj = {i: [] for i in range(len(nodes))}
+        for edge in edges:
+            src, dest = edge[0], edge[1]
+            adj[src].append(dest)
+
+        curr_ver = self.report_data["current_version"]
+        target_ver = self.target_version
+
+        # Find node indexes
+        curr_idx = -1
+        target_idx = -1
+        for idx, node in enumerate(nodes):
+            if node == curr_ver:
+                curr_idx = idx
+            if node == target_ver:
+                target_idx = idx
+
+        if curr_idx == -1:
+            print(f"Current version '{curr_ver}' not found in target upgrade channel.")
+            return
+        if target_idx == -1:
+            print(f"Target version '{target_ver}' not found in target upgrade channel.")
+            return
+
+        # Run BFS
+        queue = [[curr_idx]]
+        visited = {curr_idx}
+        path_found = None
+
+        while queue:
+            path = queue.pop(0)
+            node = path[-1]
+            if node == target_idx:
+                path_found = path
+                break
+            for neighbor in adj[node]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    new_path = list(path)
+                    new_path.append(neighbor)
+                    queue.append(new_path)
+
+        if path_found:
+            version_path = [nodes[i] for i in path_found]
+            self.report_data["upgrade_path"] = version_path
+            print(f"Valid upgrade path found: {' -> '.join(version_path)}")
+        else:
+            self.report_data["warnings_and_events"].append(
+                f"No direct upgrade path found in channel '{self.cluster_channel}' from {curr_ver} to {target_ver}. Sequential channel hops or intermediate minor version updates may be required."
+            )
 
     def create_diagnostics_directory(self):
         if self.mode == "live":
@@ -176,6 +288,15 @@ class OpenShiftUpgradePlanner:
             except:
                 pass
         
+        # Read Channel and Arch
+        channel_res = self.run_cmd("oc get clusterversion version -o jsonpath='{.spec.channel}'")
+        if channel_res["success"] and channel_res["output"]:
+            self.cluster_channel = channel_res["output"].strip()
+
+        arch_res = self.run_cmd("oc get nodes -o jsonpath='{.items[0].metadata.labels.kubernetes\\.io/arch}'")
+        if arch_res["success"] and arch_res["output"]:
+            self.cluster_arch = arch_res["output"].strip()
+            
         self.run_cmd(f"oc get co -o json > {self.output_dir}/co.json")
         self.run_cmd(f"oc get mcp -o json > {self.output_dir}/mcp.json")
         self.run_cmd(f"oc get nodes -o json > {self.output_dir}/nodes.json")
@@ -507,13 +628,11 @@ class OpenShiftUpgradePlanner:
             csv_name = csv["name"]
             raw_csv = csv["raw_data"]
             
-            # --- DYNAMIC CHECK 1: OLM MaxOpenShiftVersion Annotation / Properties ---
+            # --- DYNAMIC CHECK: OLM MaxOpenShiftVersion Annotation / Properties ---
             max_ver = None
             annotations = raw_csv.get("metadata", {}).get("annotations", {})
             if annotations:
                 max_ver = annotations.get("olm.maxOpenShiftVersion")
-                
-                # Check olm.properties string JSON
                 properties_str = annotations.get("olm.properties")
                 if properties_str:
                     try:
@@ -542,11 +661,11 @@ class OpenShiftUpgradePlanner:
                             f"Dynamic Blocker: Operator '{csv_name}' restricts OCP upgrades past version {max_ver} (olm.maxOpenShiftVersion). "
                             f"Recommendation: Upgrade this operator before cluster upgrade."
                         )
-                        continue  # Skip static check if dynamic check failed
+                        continue
                 except ValueError:
                     pass
 
-            # --- DYNAMIC CHECK 2: Static Mapping Fallback (For ACM, GitOps, ODF) ---
+            # --- STATIC CHECK FALLBACK ---
             package_name = None
             version_str = None
             for key in self.COMPATIBILITY_MATRICES.keys():
@@ -575,7 +694,6 @@ class OpenShiftUpgradePlanner:
                         "compatible": False,
                         "recommended_operator_version": recommended_version
                     }
-                    # Prevent duplicate errors for same operator
                     if not any(iss["operator"] == package_name for iss in self.report_data["operator_compatibility_issues"]):
                         self.report_data["operator_compatibility_issues"].append(issue)
                         self.report_data["overall_status"] = "FAIL"
@@ -651,6 +769,16 @@ Execution Mode: `{self.report_data["mode"].upper()}` (Must-gather structure: `{s
 
 ---
 
+## Upgrade Graph Path Verification
+"""
+        if self.report_data["upgrade_path"]:
+            path_str = " $\\rightarrow$ ".join([f"`{v}`" for v in self.report_data["upgrade_path"]])
+            md += f"✅ **Valid Upgrade Path Found:**\n\n{path_str}\n"
+        else:
+            md += "❌ **No Direct/Valid path found in upstream update graph.** Check updates configuration or channel hops.\n"
+
+        md += """
+
 ## Must-Gather Analysis Report
 
 ### 1. Add-on Operator Compatibility Matrix Checks
@@ -716,9 +844,11 @@ The planner cross-referenced your OLM operators against OpenShift target version
         if self.mode == "live":
             self.check_oc_connection()
             self.create_diagnostics_directory()
+            self.ask_credentials_and_proxy()
             self.collect_redhat_support_dumps()
             self.run_must_gather_command_generation()
             self.execute_live_checks()
+            self.query_upgrade_graph()
             
         self.analyze_etcd()
         self.analyze_cluster_operators()
@@ -737,7 +867,8 @@ if __name__ == "__main__":
     parser.add_argument("target_version", help="Target OpenShift version")
     parser.add_argument("--mode", choices=["live", "offline"], default="live")
     parser.add_argument("--dir", default="/tmp/UPGRADE")
+    parser.add_argument("--proxy", default=None, help="Proxy URL for Upgrade Graph HTTP request")
     
     args = parser.parse_args()
-    planner = OpenShiftUpgradePlanner(target_version=args.target_version, output_dir=args.dir, mode=args.mode)
+    planner = OpenShiftUpgradePlanner(target_version=args.target_version, output_dir=args.dir, mode=args.mode, proxy=args.proxy)
     planner.run_all()
