@@ -217,12 +217,59 @@ oc get events -A --field-selector type=Warning | sort -k 2
 ```
 Look for recurring `FailedMount`, `DiskPressure`, `MemoryPressure`, or `BackOff` errors.
 
-### 6.3 Diagnostic "Must-Gather" Collection
-Take a complete diagnostic snapshot of the cluster state. If the upgrade encounters issues, this snapshot will be requested by Red Hat Support.
+### 6.3 Standard Red Hat Support Pre-Upgrade Diagnostics
+When opening a ticket, Red Hat Support requires a standard diagnostic bundle and status analysis. Run the following commands to export files to `/tmp/UPGRADE/` for upload:
 
 ```bash
-oc adm must-gather --image=registry.redhat.io/openshift4/ose-must-gather:latest --dest-dir=./must-gather-pre-upgrade
+# 1. Create target directory
+mkdir -p /tmp/UPGRADE/
+
+# 2. Collect must-gather for cluster storage (OCS/ODF) and virtualization (CNV)
+odf_mg=$(oc -n openshift-storage get deployment.apps/ocs-operator -o jsonpath='{.metadata.ownerReferences[0].name}')
+oc adm must-gather --image=$(oc -n openshift-storage get csv/$odf_mg -o json | jq '.spec.relatedImages[] | select (.name | contains ("must-gather")) | .image' | sed 's/\"//g') --image-stream=openshift/must-gather --image=registry.redhat.io/container-native-virtualization/cnv-must-gather-rhel9:v4.18-1784294790 --dest-dir=/tmp/UPGRADE/must-gather-data
+
+# 3. Dump cluster-info
+oc cluster-info dump > /tmp/UPGRADE/cluster-info.out
+
+# 4. Dump resource configurations, pods, subscriptions, and events
+oc get all -A > /tmp/UPGRADE/resource-all.out
+oc get pod -A > /tmp/UPGRADE/pods-all.out
+oc get subs -A > /tmp/UPGRADE/subs-all.out
+oc get events -A > /tmp/UPGRADE/events-all.out
+
+# 5. Node Descriptions
+for NODE in $(oc get nodes -o go-template='{{range .items}}{{.metadata.name}}{{"\n"}}{{end}}'); do 
+  oc describe node $NODE > /tmp/UPGRADE/$NODE.info
+done
+
+# 6. API Request Counts (Deprecated API Check)
+oc get apirequestcounts > /tmp/UPGRADE/apirequestcounts.out
+
+# Trace User-Agents and users calling deprecated APIs
+oc get apirequestcounts -o jsonpath='{range .items[?(@.status.removedInRelease!="")]}{.metadata.name}{"\n"}{end}' | xargs -I {} sh -c 'echo "\n==> $1\n" && oc get apirequestcount $1 -o yaml | grep -E "username:|userAgent:" | sort | uniq' sh {} > /tmp/UPGRADE/apirequest-userAgent.out
+
+# Request count per removed release version
+oc get apirequestcounts -o jsonpath='{range .items[?(@.status.removedInRelease!="")]}{.status.removedInRelease}{"\t"}{.status.requestCount}{"\t"}{.metadata.name}{"\n"}{end}' > /tmp/UPGRADE/apirequest-removedInRelease_count.out
+
+# 7. etcd Deep Status
+oc exec -n openshift-etcd $(oc get pods -n openshift-etcd -l app=etcd --field-selector="status.phase==Running" -o jsonpath="{.items[0].metadata.name}") -c etcdctl -- bash -c "etcdctl member list -w table;etcdctl endpoint health --cluster -w table;etcdctl endpoint status --cluster -w table;etcdctl alarm list" > /tmp/UPGRADE/etcd-status.out
+
+# 8. Certificate Expiry and Issuer Inspection
+oc get secrets -A -o json | jq -r '.items | sort_by(.metadata.namespace,.metadata.name) |.[] |select((.type == "kubernetes.io/tls") or (.type == "SecretTypeTLS"))| "\(.metadata.namespace) \(.metadata.name) \(.data | to_entries[] | select(.key | test("key") or test("Key") | not)| .value)"' | while read namespace name cert; do 
+  echo -e "\n${namespace} - ${name}\n##################################################"
+  echo $cert | base64 -d | openssl crl2pkcs7 -nocrl -certfile /dev/stdin | openssl pkcs7 -print_certs -text -noout | grep -A4 Issuer:
+done > /tmp/UPGRADE/certs.out
+
+(echo -e "NAMESPACE\tNAME\tEXPIRY" && oc get secrets -A -o go-template='{{range .items}}{{if eq .type "kubernetes.io/tls"}}{{.metadata.namespace}}{{" "}}{{.metadata.name}}{{" "}}{{index .data "tls.crt"}}{{"\n"}}{{end}}{{end}}' | while read namespace name cert; do 
+  echo -en "$namespace\t$name\t"
+  echo $cert | base64 -d | openssl x509 -noout -enddate
+done ) | column -t > /tmp/UPGRADE/certs2.out
 ```
+
+### 6.4 How to Analyze Diagnostic Dumps
+* **etcd-status.out:** Ensure no active alarms exist (like `NOSPACE` or `CORRUPT`) and check that endpoint roundtrip latencies are within healthy thresholds (< 100ms).
+* **apirequest-removedInRelease_count.out:** Inspect any API that lists the target version in the `removedInRelease` column. If request counts are greater than 0, block the upgrade and migrate those clients.
+* **certs2.out:** Ensure no active certificates in `openshift-*` namespaces are expiring in less than 30 days.
 
 ---
 
