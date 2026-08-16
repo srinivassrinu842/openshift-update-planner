@@ -3,14 +3,17 @@ import subprocess
 import json
 import sys
 import os
+import re
 from datetime import datetime
 
 class OpenShiftUpgradePlanner:
-    def __init__(self, target_version, output_dir="/tmp/UPGRADE"):
+    def __init__(self, target_version, output_dir="/tmp/UPGRADE", mode="live"):
         self.target_version = target_version
         self.output_dir = output_dir
+        self.mode = mode.lower()  # 'live' or 'offline'
         self.report_data = {
             "timestamp": datetime.now().isoformat(),
+            "mode": self.mode,
             "target_version": target_version,
             "current_version": "Unknown",
             "etcd_health": "Unknown",
@@ -19,14 +22,18 @@ class OpenShiftUpgradePlanner:
             "machine_config_pools": [],
             "nodes": [],
             "addon_operators": [],
-            "warnings_and_events": [],
+            "unhealthy_pods": [],
+            "failed_subscriptions": [],
             "deprecated_apis_in_use": [],
             "expiring_certificates": [],
+            "warnings_and_events": [],
             "overall_status": "PASS",
             "errors": []
         }
 
     def run_cmd(self, cmd):
+        if self.mode == "offline":
+            return {"success": False, "error": "Running in offline mode; commands skipped."}
         try:
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
             if result.returncode != 0:
@@ -58,10 +65,15 @@ class OpenShiftUpgradePlanner:
                         self.report_data["current_version"] = line.split()[-1]
 
     def create_diagnostics_directory(self):
-        print(f"Creating diagnostics directory at {self.output_dir}...")
-        os.makedirs(self.output_dir, exist_ok=True)
+        if self.mode == "live":
+            print(f"Creating diagnostics directory at {self.output_dir}...")
+            os.makedirs(self.output_dir, exist_ok=True)
 
     def collect_redhat_support_dumps(self):
+        if self.mode == "offline":
+            print("Skipping diagnostic dump collection (Offline mode).")
+            return
+
         print("Collecting standard cluster diagnostic dumps...")
         
         # 1. Cluster Info Dump
@@ -93,8 +105,11 @@ class OpenShiftUpgradePlanner:
                 self.run_cmd(f"oc describe node {node} > {self.output_dir}/{node}.info")
 
     def run_must_gather_command_generation(self):
+        if self.mode == "offline":
+            self.report_data["must_gather_command"] = "Skipped in offline mode"
+            return
+            
         print("Generating required Red Hat support must-gather commands...")
-        # Get OCS/ODF operator CSV name
         odf_csv_res = self.run_cmd("oc -n openshift-storage get deployment.apps/ocs-operator -o jsonpath='{.metadata.ownerReferences[0].name}'")
         odf_image_str = ""
         if odf_csv_res["success"] and odf_csv_res["output"]:
@@ -104,24 +119,44 @@ class OpenShiftUpgradePlanner:
                 odf_image_str = f"--image={image_res['output'].strip()}"
         
         cnv_image = "--image=registry.redhat.io/container-native-virtualization/cnv-must-gather-rhel9:v4.18-1784294790"
-        
         must_gather_cmd = f"oc adm must-gather {odf_image_str} --image-stream=openshift/must-gather {cnv_image}"
         
-        # Write the generated command to a script file in the UPGRADE directory for support
         with open(f"{self.output_dir}/must-gather-trigger.sh", "w") as f:
             f.write("#!/bin/bash\n")
             f.write(f"{must_gather_cmd} --dest-dir={self.output_dir}/must-gather-data\n")
         os.chmod(f"{self.output_dir}/must-gather-trigger.sh", 0o755)
         self.report_data["must_gather_command"] = must_gather_cmd
 
-    def check_etcd(self):
-        print("Checking etcd health & alarms...")
-        # Find etcd pod name
+    def execute_live_checks(self):
+        if self.mode == "offline":
+            return
+            
+        print("Running live cluster validation commands...")
+        # Get OCP Version
+        version_res = self.run_cmd("oc version -o json")
+        if version_res["success"]:
+            try:
+                version_data = json.loads(version_res["output"])
+                self.report_data["current_version"] = version_data.get("openshiftVersion", "Unknown")
+            except:
+                pass
+        
+        # OCP Core Operators
+        self.run_cmd("oc get co -o json > " + f"{self.output_dir}/co.json")
+        
+        # Machine Config Pools
+        self.run_cmd("oc get mcp -o json > " + f"{self.output_dir}/mcp.json")
+        
+        # Nodes
+        self.run_cmd("oc get nodes -o json > " + f"{self.output_dir}/nodes.json")
+        
+        # CSVs
+        self.run_cmd("oc get csv -A -o json > " + f"{self.output_dir}/csv.json")
+        
+        # etcd deep status
         pod_res = self.run_cmd("oc get pods -n openshift-etcd -l app=etcd --field-selector='status.phase==Running' -o jsonpath='{.items[0].metadata.name}'")
         if pod_res["success"] and pod_res["output"]:
             pod_name = pod_res["output"].strip()
-            
-            # Execute diagnostic command
             etcd_cmd = (
                 f"oc exec -n openshift-etcd {pod_name} -c etcdctl -- bash -c "
                 f"\"etcdctl member list -w table; "
@@ -133,40 +168,10 @@ class OpenShiftUpgradePlanner:
             if etcd_res["success"]:
                 with open(f"{self.output_dir}/etcd-status.out", "w") as f:
                     f.write(etcd_res["output"])
-                
-                # Analyze output
-                output = etcd_res["output"]
-                if "unhealthy" in output.lower():
-                    self.report_data["etcd_health"] = "DEGRADED"
-                    self.report_data["overall_status"] = "FAIL"
-                    self.report_data["errors"].append("etcd reports unhealthy endpoints in etcdctl endpoint health.")
-                else:
-                    self.report_data["etcd_health"] = "HEALTHY"
-                
-                # Parse alarms
-                alarm_lines = [line for line in output.splitlines() if "alarm" in line.lower() or "alarm list" in line.lower()]
-                # If there are active alarms listed after the alarm list call
-                alarm_idx = output.find("alarm list")
-                if alarm_idx != -1:
-                    alarm_section = output[alarm_idx:].strip()
-                    alarm_lines_list = alarm_section.splitlines()[1:] # skip header
-                    active_alarms = [l for l in alarm_lines_list if l.strip()]
-                    if active_alarms:
-                        self.report_data["etcd_alarms"] = ", ".join(active_alarms)
-                        self.report_data["overall_status"] = "FAIL"
-                        self.report_data["errors"].append(f"etcd has active alarms: {active_alarms}")
-            else:
-                self.report_data["etcd_health"] = "UNKNOWN"
-                self.report_data["errors"].append(f"Failed to execute etcdctl diagnostics: {etcd_res['error']}")
-        else:
-            self.report_data["etcd_health"] = "UNAVAILABLE"
-            self.report_data["errors"].append("Could not find any running etcd pod to execute diagnostics.")
 
-    def check_deprecated_apis(self):
-        print("Checking for deprecated or removed APIs in use...")
+        # API requests
         self.run_cmd(f"oc get apirequestcounts > {self.output_dir}/apirequestcounts.out")
         
-        # UserAgent count list
         ua_cmd = (
             "oc get apirequestcounts -o jsonpath='{range .items[?(@.status.removedInRelease!=\"\")]}{.metadata.name}{\"\\n\"}{end}' | "
             "xargs -I {} sh -c 'echo \"\\n==> $1\\n\" && oc get apirequestcount $1 -o yaml | grep -E \"username:|userAgent:\" | sort | uniq' sh {} "
@@ -174,43 +179,13 @@ class OpenShiftUpgradePlanner:
         )
         self.run_cmd(ua_cmd)
         
-        # RemovedInRelease count summary
         summary_cmd = (
             "oc get apirequestcounts -o jsonpath='{range .items[?(@.status.removedInRelease!=\"\")]}{.status.removedInRelease}{\"\\t\"}{.status.requestCount}{\"\\t\"}{.metadata.name}{\"\\n\"}{end}' "
             f"> {self.output_dir}/apirequest-removedInRelease_count.out"
         )
         self.run_cmd(summary_cmd)
         
-        # Parse findings in python
-        if os.path.exists(f"{self.output_dir}/apirequest-removedInRelease_count.out"):
-            with open(f"{self.output_dir}/apirequest-removedInRelease_count.out", "r") as f:
-                lines = f.readlines()
-                for line in lines:
-                    parts = line.strip().split("\t")
-                    if len(parts) >= 3:
-                        release, count, api_name = parts[0], parts[1], parts[2]
-                        if int(count) > 0:
-                            self.report_data["deprecated_apis_in_use"].append({
-                                "api": api_name,
-                                "removed_in": release,
-                                "request_count": count
-                            })
-                            # If it's removed in or before target version, it is a blocker
-                            try:
-                                target_float = float(".".join(self.target_version.split(".")[:2]))
-                                release_float = float(release)
-                                if target_float >= release_float:
-                                    self.report_data["overall_status"] = "FAIL"
-                                    self.report_data["errors"].append(
-                                        f"API '{api_name}' is deprecated and removed in version {release}, but has {count} active requests."
-                                    )
-                            except ValueError:
-                                pass
-
-    def check_certificates(self):
-        print("Checking TLS Certificates validity & expiration dates...")
-        
-        # Dump detailed cert information
+        # Certificates
         certs_cmd = (
             "oc get secrets -A -o json | jq -r '.items | sort_by(.metadata.namespace,.metadata.name) |.[] |"
             "select((.type == \"kubernetes.io/tls\") or (.type == \"SecretTypeTLS\"))| \"\\(.metadata.namespace) \\(.metadata.name) \\(.data | to_entries[] | select(.key | test(\"key\") or test(\"Key\") | not)| .value)\"' | "
@@ -220,7 +195,6 @@ class OpenShiftUpgradePlanner:
         )
         self.run_cmd(certs_cmd)
         
-        # Parse expiration dates
         certs2_cmd = (
             "(echo -e \"NAMESPACE\\tNAME\\tEXPIRY\" && oc get secrets -A -o go-template='"
             "{{range .items}}{{if eq .type \"kubernetes.io/tls\"}}{{.metadata.namespace}}{\" \"}}{{.metadata.name}}{\" \"}}{{index .data \"tls.crt\"}}{\"\\n\"}}{{end}}{{end}}' | "
@@ -228,203 +202,285 @@ class OpenShiftUpgradePlanner:
             f"done ) | column -t > {self.output_dir}/certs2.out"
         )
         self.run_cmd(certs2_cmd)
-        
-        # Analyze certs2.out for quick-expiration
-        if os.path.exists(f"{self.output_dir}/certs2.out"):
-            with open(f"{self.output_dir}/certs2.out", "r") as f:
-                lines = f.readlines()[1:] # skip header
-                for line in lines:
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        ns = parts[0]
-                        name = parts[1]
-                        expiry_str = " ".join(parts[2:]).replace("notAfter=", "")
-                        try:
-                            expiry_clean = expiry_str.split("GMT")[0].strip()
-                            expiry_dt = datetime.strptime(expiry_clean, "%b %d %H:%M:%S %Y")
-                            days_remaining = (expiry_dt - datetime.now()).days
-                            
-                            self.report_data["expiring_certificates"].append({
-                                "namespace": ns,
-                                "name": name,
-                                "expiry": expiry_str,
-                                "days_remaining": days_remaining
-                            })
-                            
-                            if days_remaining < 30:
-                                self.report_data["warnings_and_events"].append(
-                                    f"Certificate '{name}' in namespace '{ns}' is expiring in {days_remaining} days (Expiry: {expiry_str})."
-                                )
-                                if days_remaining < 7:
-                                    self.report_data["overall_status"] = "FAIL"
-                                    self.report_data["errors"].append(
-                                        f"Critical Certificate Expiration: '{name}' in namespace '{ns}' expires in {days_remaining} days!"
-                                    )
-                        except Exception as e:
-                            self.report_data["expiring_certificates"].append({
-                                "namespace": ns,
-                                "name": name,
-                                "expiry": expiry_str,
-                                "days_remaining": "Unknown"
-                            })
 
-    def check_cluster_operators(self):
-        print("Checking core cluster operators...")
-        co_res = self.run_cmd("oc get co -o json")
-        if not co_res["success"]:
-            self.report_data["errors"].append("Failed to retrieve Cluster Operators.")
+    def analyze_etcd(self):
+        print("Analyzing etcd dumps...")
+        path = f"{self.output_dir}/etcd-status.out"
+        if not os.path.exists(path):
+            self.report_data["etcd_health"] = "UNKNOWN"
+            self.report_data["warnings_and_events"].append("etcd diagnostics file etcd-status.out not found.")
             return
 
-        try:
-            data = json.loads(co_res["output"])
-            for item in data.get("items", []):
-                name = item["metadata"]["name"]
-                available = "Unknown"
-                progressing = "Unknown"
-                degraded = "Unknown"
-                for cond in item.get("status", {}).get("conditions", []):
-                    if cond["type"] == "Available":
-                        available = cond["status"]
-                    elif cond["type"] == "Progressing":
-                        progressing = cond["status"]
-                    elif cond["type"] == "Degraded":
-                        degraded = cond["status"]
-                
-                status_ok = (available == "True" and degraded == "False" and progressing == "False")
-                self.report_data["cluster_operators"].append({
-                    "name": name,
-                    "available": available,
-                    "progressing": progressing,
-                    "degraded": degraded,
-                    "status_ok": status_ok
-                })
-                if not status_ok:
-                    self.report_data["overall_status"] = "FAIL"
-                    self.report_data["errors"].append(f"Cluster Operator '{name}' is in an unstable state (Available={available}, Degraded={degraded}, Progressing={progressing}).")
-        except Exception as e:
-            self.report_data["errors"].append(f"Error parsing Cluster Operators: {str(e)}")
+        with open(path, "r") as f:
+            content = f.read()
+            if "unhealthy" in content.lower():
+                self.report_data["etcd_health"] = "DEGRADED"
+                self.report_data["overall_status"] = "FAIL"
+                self.report_data["errors"].append("etcd shows unhealthy endpoints in endpoint health table.")
+            else:
+                self.report_data["etcd_health"] = "HEALTHY"
 
-    def check_machine_config_pools(self):
-        print("Checking Machine Config Pools (MCPs)...")
-        mcp_res = self.run_cmd("oc get mcp -o json")
-        if not mcp_res["success"]:
-            self.report_data["errors"].append("Failed to retrieve Machine Config Pools.")
+            # Parse alarms
+            alarm_idx = content.find("alarm list")
+            if alarm_idx != -1:
+                alarm_section = content[alarm_idx:].strip()
+                lines = alarm_section.splitlines()[1:]
+                active_alarms = [l.strip() for l in lines if l.strip()]
+                if active_alarms:
+                    self.report_data["etcd_alarms"] = ", ".join(active_alarms)
+                    self.report_data["overall_status"] = "FAIL"
+                    self.report_data["errors"].append(f"etcd cluster has active alarms: {active_alarms}")
+
+    def analyze_cluster_operators(self):
+        print("Analyzing Cluster Operators...")
+        path = f"{self.output_dir}/co.json"
+        if not os.path.exists(path):
+            self.report_data["warnings_and_events"].append("co.json not found, skipping core operator analysis.")
             return
-
-        try:
-            data = json.loads(mcp_res["output"])
-            for item in data.get("items", []):
-                name = item["metadata"]["name"]
-                paused = item.get("spec", {}).get("paused", False)
-                degraded = False
-                updated = False
-                updating = False
-                
-                for cond in item.get("status", {}).get("conditions", []):
-                    if cond["type"] == "Degraded" and cond["status"] == "True":
-                        degraded = True
-                    elif cond["type"] == "Updated" and cond["status"] == "True":
-                        updated = True
-                    elif cond["type"] == "Updating" and cond["status"] == "True":
-                        updating = True
-
-                self.report_data["machine_config_pools"].append({
-                    "name": name,
-                    "paused": paused,
-                    "degraded": degraded,
-                    "updated": updated,
-                    "updating": updating
-                })
-                
-                if degraded:
-                    self.report_data["overall_status"] = "FAIL"
-                    self.report_data["errors"].append(f"MachineConfigPool '{name}' is degraded.")
-                if paused:
-                    self.report_data["warnings_and_events"].append(f"MachineConfigPool '{name}' is paused. Nodes will not automatically update until unpaused.")
-        except Exception as e:
-            self.report_data["errors"].append(f"Error parsing Machine Config Pools: {str(e)}")
-
-    def check_nodes(self):
-        print("Checking nodes status...")
-        nodes_res = self.run_cmd("oc get nodes -o json")
-        if not nodes_res["success"]:
-            self.report_data["errors"].append("Failed to retrieve nodes information.")
-            return
-
-        try:
-            data = json.loads(nodes_res["output"])
-            for item in data.get("items", []):
-                name = item["metadata"]["name"]
-                roles = [key.replace("node-role.kubernetes.io/", "") for key in item["metadata"].get("labels", {}).keys() if "node-role.kubernetes.io/" in key]
-                role_str = ",".join(roles) if roles else "worker"
-                
-                ready = "Unknown"
-                for cond in item.get("status", {}).get("conditions", []):
-                    if cond["type"] == "Ready":
-                        ready = cond["status"]
-                        break
-                
-                unschedulable = item.get("spec", {}).get("unschedulable", False)
-                
-                self.report_data["nodes"].append({
-                    "name": name,
-                    "role": role_str,
-                    "ready": ready,
-                    "unschedulable": unschedulable
-                })
-                
-                if ready != "True":
-                    self.report_data["overall_status"] = "FAIL"
-                    self.report_data["errors"].append(f"Node '{name}' is not Ready (Status: {ready}).")
-                if unschedulable:
-                    self.report_data["warnings_and_events"].append(f"Node '{name}' is unschedulable (Cordoned).")
-        except Exception as e:
-            self.report_data["errors"].append(f"Error parsing nodes: {str(e)}")
-
-    def check_addon_operators(self):
-        print("Checking OLM Addon Operators...")
-        csv_res = self.run_cmd("oc get csv -A -o json")
-        if not csv_res["success"]:
-            self.report_data["warnings_and_events"].append("Could not retrieve ClusterServiceVersions (CSVs) for Add-on Operators.")
-            return
-
-        try:
-            data = json.loads(csv_res["output"])
-            for item in data.get("items", []):
-                name = item["metadata"]["name"]
-                namespace = item["metadata"]["namespace"]
-                phase = item.get("status", {}).get("phase", "Unknown")
-                
-                self.report_data["addon_operators"].append({
-                    "name": name,
-                    "namespace": namespace,
-                    "phase": phase
-                })
-                
-                if phase != "Succeeded":
-                    self.report_data["overall_status"] = "FAIL"
-                    self.report_data["errors"].append(f"OLM Operator '{name}' in namespace '{namespace}' is in phase '{phase}' (Expected: Succeeded).")
-        except Exception as e:
-            self.report_data["warnings_and_events"].append(f"Error parsing Addon Operators: {str(e)}")
-
-    def check_events_and_logs(self):
-        print("Checking recent cluster Warning events...")
-        events_res = self.run_cmd("oc get events -A --field-selector type=Warning -o json")
-        if events_res["success"]:
+            
+        with open(path, "r") as f:
             try:
-                data = json.loads(events_res["output"])
-                events = data.get("items", [])
-                self.report_data["warning_events_count"] = len(events)
-                for event in events[:15]:
-                    msg = event.get("message", "")
-                    reason = event.get("reason", "")
-                    obj = event.get("involvedObject", {}).get("name", "")
-                    ns = event.get("involvedObject", {}).get("namespace", "")
-                    self.report_data["warnings_and_events"].append(f"Warning Event in [{ns}] on {obj} ({reason}): {msg}")
+                data = json.load(f)
+                items = data.get("items", []) if isinstance(data, dict) else data
+                for item in items:
+                    name = item["metadata"]["name"]
+                    available = "Unknown"
+                    progressing = "Unknown"
+                    degraded = "Unknown"
+                    for cond in item.get("status", {}).get("conditions", []):
+                        if cond["type"] == "Available":
+                            available = cond["status"]
+                        elif cond["type"] == "Progressing":
+                            progressing = cond["status"]
+                        elif cond["type"] == "Degraded":
+                            degraded = cond["status"]
+                    
+                    status_ok = (available == "True" and degraded == "False" and progressing == "False")
+                    self.report_data["cluster_operators"].append({
+                        "name": name,
+                        "available": available,
+                        "progressing": progressing,
+                        "degraded": degraded,
+                        "status_ok": status_ok
+                    })
+                    if not status_ok:
+                        self.report_data["overall_status"] = "FAIL"
+                        self.report_data["errors"].append(f"Cluster Operator '{name}' is unstable (Available={available}, Degraded={degraded}, Progressing={progressing}).")
             except Exception as e:
-                pass
-        else:
-            self.report_data["warnings_and_events"].append("Failed to fetch cluster events.")
+                self.report_data["errors"].append(f"Error parsing co.json: {str(e)}")
+
+    def analyze_machine_config_pools(self):
+        print("Analyzing Machine Config Pools...")
+        path = f"{self.output_dir}/mcp.json"
+        if not os.path.exists(path):
+            return
+            
+        with open(path, "r") as f:
+            try:
+                data = json.load(f)
+                items = data.get("items", []) if isinstance(data, dict) else data
+                for item in items:
+                    name = item["metadata"]["name"]
+                    paused = item.get("spec", {}).get("paused", False)
+                    degraded = False
+                    updated = False
+                    updating = False
+                    for cond in item.get("status", {}).get("conditions", []):
+                        if cond["type"] == "Degraded" and cond["status"] == "True":
+                            degraded = True
+                        elif cond["type"] == "Updated" and cond["status"] == "True":
+                            updated = True
+                        elif cond["type"] == "Updating" and cond["status"] == "True":
+                            updating = True
+                    
+                    self.report_data["machine_config_pools"].append({
+                        "name": name,
+                        "paused": paused,
+                        "degraded": degraded,
+                        "updated": updated,
+                        "updating": updating
+                    })
+                    if degraded:
+                        self.report_data["overall_status"] = "FAIL"
+                        self.report_data["errors"].append(f"MachineConfigPool '{name}' is degraded.")
+                    if paused:
+                        self.report_data["warnings_and_events"].append(f"MachineConfigPool '{name}' is paused. Node OS/Config upgrades are suspended.")
+            except Exception as e:
+                self.report_data["errors"].append(f"Error parsing mcp.json: {str(e)}")
+
+    def analyze_nodes(self):
+        print("Analyzing nodes status...")
+        path = f"{self.output_dir}/nodes.json"
+        if not os.path.exists(path):
+            return
+            
+        with open(path, "r") as f:
+            try:
+                data = json.load(f)
+                items = data.get("items", []) if isinstance(data, dict) else data
+                for item in items:
+                    name = item["metadata"]["name"]
+                    roles = [k.replace("node-role.kubernetes.io/", "") for k in item["metadata"].get("labels", {}).keys() if "node-role.kubernetes.io/" in k]
+                    role_str = ",".join(roles) if roles else "worker"
+                    ready = "Unknown"
+                    for cond in item.get("status", {}).get("conditions", []):
+                        if cond["type"] == "Ready":
+                            ready = cond["status"]
+                            break
+                    unschedulable = item.get("spec", {}).get("unschedulable", False)
+                    
+                    self.report_data["nodes"].append({
+                        "name": name,
+                        "role": role_str,
+                        "ready": ready,
+                        "unschedulable": unschedulable
+                    })
+                    if ready != "True":
+                        self.report_data["overall_status"] = "FAIL"
+                        self.report_data["errors"].append(f"Node '{name}' is not Ready (Ready={ready}).")
+                    if unschedulable:
+                        self.report_data["warnings_and_events"].append(f"Node '{name}' is cordoned (SchedulingDisabled).")
+            except Exception as e:
+                self.report_data["errors"].append(f"Error parsing nodes.json: {str(e)}")
+
+    def analyze_pods(self):
+        print("Analyzing pod health across all namespaces...")
+        path = f"{self.output_dir}/pods-all.out"
+        if not os.path.exists(path):
+            self.report_data["warnings_and_events"].append("pods-all.out not found, skipping pod diagnostics.")
+            return
+
+        with open(path, "r") as f:
+            lines = f.readlines()[1:] # skip header
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    namespace = parts[0]
+                    name = parts[1]
+                    status = parts[2]
+                    if status not in ["Running", "Completed", "Succeeded", "Terminating"]:
+                        self.report_data["unhealthy_pods"].append({
+                            "namespace": namespace,
+                            "name": name,
+                            "status": status
+                        })
+                        self.report_data["warnings_and_events"].append(f"Unhealthy Pod: [{namespace}] {name} is in status '{status}'")
+
+    def analyze_subscriptions(self):
+        print("Analyzing OLM subscriptions...")
+        path = f"{self.output_dir}/subs-all.out"
+        if not os.path.exists(path):
+            return
+            
+        with open(path, "r") as f:
+            lines = f.readlines()[1:]
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    ns = parts[0]
+                    name = parts[1]
+                    pass
+
+    def analyze_deprecated_apis(self):
+        print("Analyzing deprecated APIs count...")
+        path = f"{self.output_dir}/apirequest-removedInRelease_count.out"
+        if not os.path.exists(path):
+            return
+            
+        with open(path, "r") as f:
+            lines = f.readlines()
+            for line in lines:
+                parts = line.strip().split("\t")
+                if len(parts) >= 3:
+                    release, count, api_name = parts[0], parts[1], parts[2]
+                    if int(count) > 0:
+                        self.report_data["deprecated_apis_in_use"].append({
+                            "api": api_name,
+                            "removed_in": release,
+                            "request_count": count
+                        })
+                        try:
+                            target_float = float(".".join(self.target_version.split(".")[:2]))
+                            release_float = float(release)
+                            if target_float >= release_float:
+                                self.report_data["overall_status"] = "FAIL"
+                                self.report_data["errors"].append(
+                                    f"Critical: API '{api_name}' is removed in release {release}, but has {count} active calls. Upgrade is blocked."
+                                )
+                        except ValueError:
+                            pass
+
+    def analyze_certificates(self):
+        print("Analyzing certificates expiry...")
+        path = f"{self.output_dir}/certs2.out"
+        if not os.path.exists(path):
+            return
+            
+        with open(path, "r") as f:
+            lines = f.readlines()[1:]
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 3:
+                    ns = parts[0]
+                    name = parts[1]
+                    expiry_str = " ".join(parts[2:]).replace("notAfter=", "")
+                    try:
+                        expiry_clean = expiry_str.split("GMT")[0].strip()
+                        expiry_dt = datetime.strptime(expiry_clean, "%b %d %H:%M:%S %Y")
+                        days_remaining = (expiry_dt - datetime.now()).days
+                        
+                        self.report_data["expiring_certificates"].append({
+                            "namespace": ns,
+                            "name": name,
+                            "expiry": expiry_str,
+                            "days_remaining": days_remaining
+                        })
+                        if days_remaining < 30:
+                            self.report_data["warnings_and_events"].append(
+                                f"TLS Secret '{name}' in [{ns}] expires in {days_remaining} days (Expiry: {expiry_str})."
+                            )
+                            if days_remaining < 7:
+                                self.report_data["overall_status"] = "FAIL"
+                                self.report_data["errors"].append(
+                                    f"Critical Certificate Expiry: '{name}' in namespace '{ns}' expires in {days_remaining} days."
+                                )
+                    except:
+                        pass
+
+    def run_known_issues_analysis(self):
+        print("Checking for known upgrade issues & version-specific blockers...")
+        try:
+            curr_match = re.search(r"4\.(\d+)", self.report_data["current_version"])
+            target_match = re.search(r"4\.(\d+)", self.target_version)
+            if curr_match and target_match:
+                curr_minor = int(curr_match.group(1))
+                target_minor = int(target_match.group(1))
+                
+                if target_minor - curr_minor > 1:
+                    self.report_data["overall_status"] = "FAIL"
+                    self.report_data["errors"].append(
+                        f"Multi-minor version hops are unsupported (Current: 4.{curr_minor} -> Target: 4.{target_minor}). You must upgrade sequentially."
+                    )
+                
+                if curr_minor == 11 and target_minor == 12:
+                    self.report_data["warnings_and_events"].append(
+                        "Note: Upgrading 4.11 -> 4.12 removes `v1beta1` ingress/flowcontrol APIs. Ensure no legacy ingress resources remain."
+                    )
+                elif curr_minor == 12 and target_minor == 13:
+                    self.report_data["warnings_and_events"].append(
+                        "Note: Upgrading 4.12 -> 4.13 removes `v1beta1` PodDisruptionBudget. Workloads must use `policy/v1`."
+                    )
+        except Exception as e:
+            pass
+
+        events_path = f"{self.output_dir}/events-all.out"
+        if os.path.exists(events_path):
+            with open(events_path, "r") as f:
+                content = f.read()
+                if "catalogsource" in content.lower() and "fail" in content.lower():
+                    self.report_data["warnings_and_events"].append(
+                        "Warning: Detected CatalogSource or Operator registry errors in cluster events. Check OLM health."
+                    )
 
     def generate_markdown_report(self):
         report_path = "upgrade_readiness_report.md"
@@ -434,12 +490,13 @@ class OpenShiftUpgradePlanner:
         
         md = f"""# OpenShift Upgrade Readiness & Diagnostic Report
 Generated on: `{self.report_data["timestamp"]}`
+Execution Mode: `{self.report_data["mode"].upper()}`
 
 ## Executive Summary
 * **Current Version:** `{self.report_data["current_version"]}`
 * **Target Version:** `{self.report_data["target_version"]}`
 * **Readiness Status:** **{status_color}**
-* **Diagnostic Dump Location:** `{self.output_dir}` (Contains all dumps requested by Red Hat Support)
+* **Diagnostic Dump Location:** `{self.output_dir}`
 
 ---
 
@@ -448,7 +505,6 @@ Generated on: `{self.report_data["timestamp"]}`
 ### 1. etcd Health & Alarms
 * **etcd Health Status:** `{self.report_data["etcd_health"]}`
 * **Active Alarms:** `{self.report_data["etcd_alarms"]}`
-* *Diagnostic output written to `{self.output_dir}/etcd-status.out`*
 
 ### 2. Deprecated & Removed APIs in Use
 Check this table for APIs that will be unavailable after the upgrade:
@@ -490,15 +546,19 @@ Check this table for APIs that will be unavailable after the upgrade:
             md += f"| `{node['name']}` | `{node['role']}` | `{node['ready']}` | `{not node['unschedulable']}` |\n"
 
         md += """
-### 6. OLM Add-on Operators
-| Operator CSV Name | Namespace | Phase | Status |
-|---|---|---|---|
+### 6. Unhealthy Pods (Warning State)
 """
-        for csv in self.report_data["addon_operators"]:
-            csv_status = "🟢 Succeeded" if csv["phase"] == "Succeeded" else "🔴 Unstable"
-            md += f"| `{csv['name']}` | `{csv['namespace']}` | `{csv['phase']}` | {csv_status} |\n"
+        if self.report_data["unhealthy_pods"]:
+            md += "| Namespace | Pod Name | Status |\n|---|---|---|\n"
+            for pod in self.report_data["unhealthy_pods"][:15]:
+                md += f"| `{pod['namespace']}` | `{pod['name']}` | `{pod['status']}` |\n"
+            if len(self.report_data["unhealthy_pods"]) > 15:
+                md += f"\n*And {len(self.report_data['unhealthy_pods']) - 15} more unhealthy pods. See `{self.output_dir}/pods-all.out`.*"
+        else:
+            md += "*All pods are healthy (Running/Succeeded).* "
 
         md += """
+
 ### 7. Expiring Certificates (Next 30 Days)
 """
         expiring = [c for c in self.report_data["expiring_certificates"] if isinstance(c["days_remaining"], int) and c["days_remaining"] < 30]
@@ -546,29 +606,32 @@ Check this table for APIs that will be unavailable after the upgrade:
         print(f"Report written successfully to {report_path}")
 
     def run_all(self):
-        self.check_oc_connection()
-        self.create_diagnostics_directory()
-        self.collect_redhat_support_dumps()
-        self.run_must_gather_command_generation()
-        self.check_etcd()
-        self.check_cluster_operators()
-        self.check_machine_config_pools()
-        self.check_nodes()
-        self.check_addon_operators()
-        self.check_deprecated_apis()
-        self.check_certificates()
-        self.check_events_and_logs()
+        if self.mode == "live":
+            self.check_oc_connection()
+            self.create_diagnostics_directory()
+            self.collect_redhat_support_dumps()
+            self.run_must_gather_command_generation()
+            self.execute_live_checks()
+            
+        self.analyze_etcd()
+        self.analyze_cluster_operators()
+        self.analyze_machine_config_pools()
+        self.analyze_nodes()
+        self.analyze_pods()
+        self.analyze_subscriptions()
+        self.analyze_deprecated_apis()
+        self.analyze_certificates()
+        self.run_known_issues_analysis()
         self.generate_markdown_report()
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 openshift_upgrade_planner.py <target_version> [output_dir]")
-        sys.argv.append("4.13.0")
+    import argparse
+    parser = argparse.ArgumentParser(description="OpenShift pre-upgrade planner.")
+    parser.add_argument("target_version", help="Target OpenShift version (e.g. 4.13.10)")
+    parser.add_argument("--mode", choices=["live", "offline"], default="live", help="Execution mode (live cluster query or offline dump analysis)")
+    parser.add_argument("--dir", default="/tmp/UPGRADE", help="Diagnostics output/input directory")
     
-    target = sys.argv[1]
-    out_dir = "/tmp/UPGRADE"
-    if len(sys.argv) > 2:
-        out_dir = sys.argv[2]
-        
-    planner = OpenShiftUpgradePlanner(target, out_dir)
+    args = parser.parse_args()
+    
+    planner = OpenShiftUpgradePlanner(target_version=args.target_version, output_dir=args.dir, mode=args.mode)
     planner.run_all()
