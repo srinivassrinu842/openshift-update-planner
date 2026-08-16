@@ -21,12 +21,14 @@ class OpenShiftUpgradePlanner:
         "ocs-operator": { # Red Hat OpenShift Data Foundation (ODF)
             "4.10": ["4.10"], "4.11": ["4.11"], "4.12": ["4.12"],
             "4.13": ["4.13"], "4.14": ["4.14"], "4.15": ["4.15"],
-            "4.16": ["4.16"], "4.17": ["4.17"], "4.18": ["4.18"]
+            "4.16": ["4.16"], "4.17": ["4.17"], "4.18": ["4.18"],
+            "4.19": ["4.19"], "4.20": ["4.20"], "4.21": ["4.21"], "4.22": ["4.22"]
         },
         "kubevirt-hyperconverged": { # OpenShift Virtualization (CNV)
             "4.10": ["4.10"], "4.11": ["4.11"], "4.12": ["4.12"],
             "4.13": ["4.13"], "4.14": ["4.14"], "4.15": ["4.15"],
-            "4.16": ["4.16"], "4.17": ["4.17"], "4.18": ["4.18"]
+            "4.16": ["4.16"], "4.17": ["4.17"], "4.18": ["4.18"],
+            "4.19": ["4.19"], "4.20": ["4.20"], "4.21": ["4.21"], "4.22": ["4.22"]
         },
         "advanced-cluster-management": { # Advanced Cluster Management (ACM)
             "2.6": ["4.10", "4.11"],
@@ -35,7 +37,8 @@ class OpenShiftUpgradePlanner:
             "2.9": ["4.12", "4.13", "4.14"],
             "2.10": ["4.13", "4.14", "4.15"],
             "2.11": ["4.14", "4.15", "4.16"],
-            "2.12": ["4.15", "4.16", "4.17"]
+            "2.12": ["4.15", "4.16", "4.17"],
+            "2.13": ["4.16", "4.17", "4.18", "4.19", "4.20", "4.21", "4.22"]
         },
         "openshift-gitops-operator": { # OpenShift GitOps (ArgoCD)
             "1.7": ["4.10", "4.11"],
@@ -44,7 +47,8 @@ class OpenShiftUpgradePlanner:
             "1.10": ["4.13", "4.14"],
             "1.11": ["4.14", "4.15"],
             "1.12": ["4.15", "4.16"],
-            "1.13": ["4.16", "4.17"]
+            "1.13": ["4.16", "4.17"],
+            "1.14": ["4.17", "4.18", "4.19", "4.20", "4.21", "4.22"]
         }
     }
 
@@ -171,7 +175,14 @@ class OpenShiftUpgradePlanner:
     def query_upgrade_graph(self):
         """Queries the Red Hat OpenShift Upgrade Graph API dynamically."""
         print(f"Querying Red Hat Upgrade Graph for path validation (Channel: {self.cluster_channel}, Arch: {self.cluster_arch})...")
-        url = f"https://api.openshift.com/api/upgrades_info/v1/graph?channel={self.cluster_channel}&arch={self.cluster_arch}"
+        
+        # Check configured upstream endpoint
+        upstream_res = self.run_cmd("oc get clusterversion version -o jsonpath='{.spec.upstream}'")
+        url = "https://api.openshift.com/api/upgrades_info/v1/graph"
+        if upstream_res["success"] and upstream_res["output"].strip():
+            url = upstream_res["output"].strip()
+            
+        full_url = f"{url}?channel={self.cluster_channel}&arch={self.cluster_arch}"
         
         try:
             # Set up proxy handler if proxy is defined
@@ -180,14 +191,37 @@ class OpenShiftUpgradePlanner:
                 opener = urllib.request.build_opener(proxy_support)
                 urllib.request.install_opener(opener)
             
-            req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+            req = urllib.request.Request(full_url, headers={'Accept': 'application/json'})
             with urllib.request.urlopen(req, timeout=15) as response:  # nosec B310
                 graph_data = json.loads(response.read().decode('utf-8'))
                 self.calculate_upgrade_path(graph_data)
         except Exception as e:
-            msg = f"Failed to fetch upgrade graph from Red Hat: {str(e)}"
+            msg = f"Failed to fetch upgrade graph dynamically: {str(e)}"
             print(f"Warning: {msg}")
             self.report_data["warnings_and_events"].append(msg)
+            self.calculate_static_fallback_path()
+
+    def calculate_static_fallback_path(self):
+        """Deduces sequential minor version hops for airgapped clusters when public API fails."""
+        curr_ver = self.report_data["current_version"]
+        target_ver = self.target_version
+        if curr_ver == "Unknown" or not target_ver:
+            return
+
+        try:
+            curr_parts = [int(x) for x in curr_ver.split(".")[:2]]
+            target_parts = [int(x) for x in target_ver.split(".")[:2]]
+            
+            if curr_parts[0] == target_parts[0]:
+                hops = []
+                major = curr_parts[0]
+                for minor in range(curr_parts[1], target_parts[1] + 1):
+                    hops.append(f"{major}.{minor}.z")
+                if len(hops) > 1:
+                    self.report_data["upgrade_path"] = hops
+                    print(f"Airgapped fallback upgrade path: {' -> '.join(hops)}")
+        except Exception:  # nosec B110
+            pass
 
     def calculate_upgrade_path(self, graph):
         """Calculates the upgrade path using Breadth-First Search (BFS) on the DAG."""
@@ -214,9 +248,11 @@ class OpenShiftUpgradePlanner:
 
         if curr_idx == -1:
             print(f"Current version '{curr_ver}' not found in target upgrade channel.")
+            self.calculate_static_fallback_path()
             return
         if target_idx == -1:
             print(f"Target version '{target_ver}' not found in target upgrade channel.")
+            self.calculate_static_fallback_path()
             return
 
         # Run BFS
@@ -243,8 +279,9 @@ class OpenShiftUpgradePlanner:
             print(f"Valid upgrade path found: {' -> '.join(version_path)}")
         else:
             self.report_data["warnings_and_events"].append(
-                f"No direct upgrade path found in channel '{self.cluster_channel}' from {curr_ver} to {target_ver}. Sequential channel hops or intermediate minor version updates may be required."
+                f"No direct upgrade path found in channel '{self.cluster_channel}' from {curr_ver} to {target_ver}."
             )
+            self.calculate_static_fallback_path()
 
     def create_diagnostics_directory(self):
         if self.mode == "live":
@@ -769,6 +806,7 @@ class OpenShiftUpgradePlanner:
     def generate_markdown_report(self):
         report_path = "upgrade_readiness_report.md"
         status_color = "🔴 FAIL" if self.report_data["overall_status"] == "FAIL" else "🟢 PASS"
+        target_ocp_minor = ".".join(self.target_version.split(".")[:2])
         
         md = f"""# OpenShift Upgrade Readiness & must-gather Diagnostic Report
 Generated on: `{self.report_data["timestamp"]}`
@@ -793,15 +831,25 @@ Execution Mode: `{self.report_data["mode"].upper()}` (Must-gather structure: `{s
 
 ## Must-Gather Analysis Report
 
-### 1. Add-on Operator Compatibility Matrix Checks
+### 1. Add-on Operator Compatibility Checks
 The planner cross-referenced your OLM operators against OpenShift target version compatibility matrices (including dynamic checks for OLM `olm.maxOpenShiftVersion` boundaries):
+| Operator / CSV | Installed Version | Target OCP | Compatibility | Recommendation |
+|---|---|---|---|---|
 """
-        if self.report_data["operator_compatibility_issues"]:
-            md += "| Operator / CSV | Installed Version | Target OCP | Compatibility | Recommendation |\n|---|---|---|---|---|\n"
+        for csv in self.report_data["addon_operators"]:
+            csv_name = csv["name"]
+            matching_issue = None
             for issue in self.report_data["operator_compatibility_issues"]:
-                md += f"| `{issue['operator']}` | `{issue['installed_version']}` | `{issue['target_ocp_version']}` | 🔴 Incompatible | {issue['recommended_operator_version']} before cluster upgrade |\n"
-        else:
-            md += "*All detected addon operators are compatible with the target version.*"
+                if issue["operator"] == csv_name or (issue.get("installed_csv") == csv_name) or (issue.get("operator") in csv_name):
+                    matching_issue = issue
+                    break
+            
+            if matching_issue:
+                md += f"| `{csv_name}` | `{matching_issue['installed_version']}` | `{matching_issue['target_ocp_version']}` | 🔴 Incompatible | {matching_issue['recommended_operator_version']} before cluster upgrade |\n"
+            else:
+                ver_match = re.search(r"v?(\d+\.\d+[\.\d]*)", csv_name)
+                installed_version = ver_match.group(1) if ver_match else "Detected"
+                md += f"| `{csv_name}` | `{installed_version}` | `{target_ocp_minor}` | 🟢 Compatible | No action required |\n"
 
         md += """
 
@@ -839,6 +887,20 @@ The planner cross-referenced your OLM operators against OpenShift target version
                 md += f"| `{pod['namespace']}` | `{pod['name']}` | `{pod['status']}` |\n"
         else:
             md += "*No unhealthy pods parsed from diagnostic dumps.*"
+
+        md += """
+
+### 6. Certificate Expiration Status
+"""
+        if self.report_data["expiring_certificates"]:
+            md += "| Namespace | Secret Name | Expiry Date | Days Remaining |\n|---|---|---|---|\n"
+            # Sort by days remaining (ascending) to show soonest expiring first
+            sorted_certs = sorted(self.report_data["expiring_certificates"], key=lambda k: k.get("days_remaining", 9999))
+            for cert in sorted_certs[:25]:  # List top 25 soonest expiring certificates
+                day_status = "🟢 OK" if cert['days_remaining'] > 30 else "🔴 ACTION REQUIRED"
+                md += f"| `{cert['namespace']}` | `{cert['name']}` | `{cert['expiry']}` | `{cert['days_remaining']}` days ({day_status}) |\n"
+        else:
+            md += "*No expiring certificates parsed from secret dumps.*"
 
         md += "\n--- \n\n## Warnings & Critical Blockers\n"
         if self.report_data["errors"]:
