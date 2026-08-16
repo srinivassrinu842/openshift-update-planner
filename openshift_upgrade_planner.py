@@ -8,6 +8,38 @@ from datetime import datetime
 import yaml  # In standard environments, we can fallback to regex parser if PyYAML is missing
 
 class OpenShiftUpgradePlanner:
+    # Static fallbacks for primary operators, but we now check all operators dynamically
+    COMPATIBILITY_MATRICES = {
+        "ocs-operator": { # Red Hat OpenShift Data Foundation (ODF)
+            "4.10": ["4.10"], "4.11": ["4.11"], "4.12": ["4.12"],
+            "4.13": ["4.13"], "4.14": ["4.14"], "4.15": ["4.15"],
+            "4.16": ["4.16"], "4.17": ["4.17"], "4.18": ["4.18"]
+        },
+        "kubevirt-hyperconverged": { # OpenShift Virtualization (CNV)
+            "4.10": ["4.10"], "4.11": ["4.11"], "4.12": ["4.12"],
+            "4.13": ["4.13"], "4.14": ["4.14"], "4.15": ["4.15"],
+            "4.16": ["4.16"], "4.17": ["4.17"], "4.18": ["4.18"]
+        },
+        "advanced-cluster-management": { # Advanced Cluster Management (ACM)
+            "2.6": ["4.10", "4.11"],
+            "2.7": ["4.10", "4.11", "4.12"],
+            "2.8": ["4.11", "4.12", "4.13"],
+            "2.9": ["4.12", "4.13", "4.14"],
+            "2.10": ["4.13", "4.14", "4.15"],
+            "2.11": ["4.14", "4.15", "4.16"],
+            "2.12": ["4.15", "4.16", "4.17"]
+        },
+        "openshift-gitops-operator": { # OpenShift GitOps (ArgoCD)
+            "1.7": ["4.10", "4.11"],
+            "1.8": ["4.11", "4.12"],
+            "1.9": ["4.12", "4.13"],
+            "1.10": ["4.13", "4.14"],
+            "1.11": ["4.14", "4.15"],
+            "1.12": ["4.15", "4.16"],
+            "1.13": ["4.16", "4.17"]
+        }
+    }
+
     def __init__(self, target_version, output_dir="/tmp/UPGRADE", mode="live"):
         self.target_version = target_version
         self.output_dir = output_dir
@@ -24,6 +56,7 @@ class OpenShiftUpgradePlanner:
             "machine_config_pools": [],
             "nodes": [],
             "addon_operators": [],
+            "operator_compatibility_issues": [],
             "unhealthy_pods": [],
             "failed_subscriptions": [],
             "deprecated_apis_in_use": [],
@@ -34,14 +67,12 @@ class OpenShiftUpgradePlanner:
         }
 
     def load_yaml(self, path):
-        """Loads a YAML file using PyYAML or basic regex-based fallback if PyYAML is missing."""
         if not os.path.exists(path):
             return None
         try:
             with open(path, 'r') as f:
                 return yaml.safe_load(f)
         except ImportError:
-            # Simple fallback parser for basic metadata reading
             with open(path, 'r') as f:
                 content = f.read()
             return self._fallback_yaml_parse(content)
@@ -49,26 +80,28 @@ class OpenShiftUpgradePlanner:
             return None
 
     def _fallback_yaml_parse(self, content):
-        """Basic regex parser to extract common fields like name, status, phase from YAML."""
         result = {}
         metadata = {}
         status = {}
-        
-        # Simple extraction using regex
         name_match = re.search(r"name:\s*([\w\-\.]+)", content)
         if name_match:
             metadata["name"] = name_match.group(1)
-            
         phase_match = re.search(r"phase:\s*(\w+)", content)
         if phase_match:
             status["phase"] = phase_match.group(1)
+        
+        # Capture annotations block if simple
+        annotations = {}
+        ann_matches = re.findall(r"olm\.maxOpenShiftVersion:\s*\"?([\w\-\.]+)\"?", content)
+        if ann_matches:
+            annotations["olm.maxOpenShiftVersion"] = ann_matches[0]
             
+        metadata["annotations"] = annotations
         result["metadata"] = metadata
         result["status"] = status
         return result
 
     def detect_must_gather(self):
-        """Checks if the output_dir is structured as a standard must-gather directory."""
         if self.mode == "offline":
             check_paths = [
                 os.path.join(self.output_dir, "cluster-scoped-resources"),
@@ -135,7 +168,6 @@ class OpenShiftUpgradePlanner:
         if self.mode == "offline":
             return
         
-        # OCP version & core info
         version_res = self.run_cmd("oc version -o json")
         if version_res["success"]:
             try:
@@ -149,7 +181,7 @@ class OpenShiftUpgradePlanner:
         self.run_cmd(f"oc get nodes -o json > {self.output_dir}/nodes.json")
         self.run_cmd(f"oc get csv -A -o json > {self.output_dir}/csv.json")
         
-        # etcd deep status
+        # etcd status
         pod_res = self.run_cmd("oc get pods -n openshift-etcd -l app=etcd --field-selector='status.phase==Running' -o jsonpath='{.items[0].metadata.name}'")
         if pod_res["success"] and pod_res["output"]:
             pod_name = pod_res["output"].strip()
@@ -197,8 +229,6 @@ class OpenShiftUpgradePlanner:
         print("Analyzing etcd status...")
         path = f"{self.output_dir}/etcd-status.out"
         if self.is_must_gather:
-            # In must-gather, we can inspect openshift-etcd namespace logs or core yaml
-            # E.g. finding etcd pod statuses
             self.report_data["etcd_health"] = "Refer to etcd operators in must-gather"
             return
             
@@ -225,23 +255,18 @@ class OpenShiftUpgradePlanner:
 
     def analyze_cluster_operators(self):
         print("Analyzing Cluster Operators...")
-        
         if self.is_must_gather:
-            # Parse from must-gather clusterversion or clusteroperators folder
             co_dir = os.path.join(self.output_dir, "cluster-scoped-resources", "config.openshift.io", "clusteroperators")
             if not os.path.exists(co_dir):
-                # Check root cluster-scoped-resources file
                 co_file = os.path.join(self.output_dir, "cluster-scoped-resources", "clusteroperators.yaml")
                 if os.path.exists(co_file):
                     self._parse_co_yaml(co_file)
                 return
-                
             for filename in os.listdir(co_dir):
                 if filename.endswith(".yaml"):
                     self._parse_co_yaml(os.path.join(co_dir, filename))
             return
 
-        # Default parse co.json
         path = f"{self.output_dir}/co.json"
         if not os.path.exists(path):
             return
@@ -278,7 +303,6 @@ class OpenShiftUpgradePlanner:
         data = self.load_yaml(path)
         if not data:
             return
-        # Handle lists or single objects
         items = data.get("items", [data]) if isinstance(data, dict) else [data]
         for item in items:
             name = item.get("metadata", {}).get("name", "Unknown")
@@ -382,7 +406,6 @@ class OpenShiftUpgradePlanner:
                                 self.report_data["errors"].append(f"Node '{name}' in must-gather is not Ready.")
             return
 
-        # Default parse nodes.json
         path = f"{self.output_dir}/nodes.json"
         if not os.path.exists(path):
             return
@@ -407,7 +430,6 @@ class OpenShiftUpgradePlanner:
     def analyze_pods(self):
         print("Analyzing pods...")
         if self.is_must_gather:
-            # Search namespaces for unhealthy pods
             ns_dir = os.path.join(self.output_dir, "namespaces")
             if os.path.exists(ns_dir):
                 for ns in os.listdir(ns_dir):
@@ -441,9 +463,129 @@ class OpenShiftUpgradePlanner:
                                 "status": status
                             })
 
+    def analyze_addon_operators(self):
+        print("Analyzing Addon CSV Operators & Compatibility matrices...")
+        csvs = []
+        if self.is_must_gather:
+            ns_dir = os.path.join(self.output_dir, "namespaces")
+            if os.path.exists(ns_dir):
+                for ns in os.listdir(ns_dir):
+                    csv_path = os.path.join(ns_dir, ns, "operators.coreos.com", "clusterserviceversions")
+                    if os.path.exists(csv_path):
+                        for filename in os.listdir(csv_path):
+                            if filename.endswith(".yaml"):
+                                data = self.load_yaml(os.path.join(csv_path, filename))
+                                if data:
+                                    csvs.append({
+                                        "name": data.get("metadata", {}).get("name", "Unknown"),
+                                        "namespace": ns,
+                                        "phase": data.get("status", {}).get("phase", "Unknown"),
+                                        "raw_data": data
+                                    })
+        else:
+            path = f"{self.output_dir}/csv.json"
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    try:
+                        data = json.load(f)
+                        items = data.get("items", []) if isinstance(data, dict) else data
+                        for item in items:
+                            csvs.append({
+                                "name": item["metadata"]["name"],
+                                "namespace": item["metadata"]["namespace"],
+                                "phase": item.get("status", {}).get("phase", "Unknown"),
+                                "raw_data": item
+                            })
+                    except:
+                        pass
+
+        self.report_data["addon_operators"] = csvs
+        target_ocp_minor = ".".join(self.target_version.split(".")[:2])
+        target_ocp_float = float(target_ocp_minor)
+
+        for csv in csvs:
+            csv_name = csv["name"]
+            raw_csv = csv["raw_data"]
+            
+            # --- DYNAMIC CHECK 1: OLM MaxOpenShiftVersion Annotation / Properties ---
+            max_ver = None
+            annotations = raw_csv.get("metadata", {}).get("annotations", {})
+            if annotations:
+                max_ver = annotations.get("olm.maxOpenShiftVersion")
+                
+                # Check olm.properties string JSON
+                properties_str = annotations.get("olm.properties")
+                if properties_str:
+                    try:
+                        properties = json.loads(properties_str)
+                        for prop in properties:
+                            if prop.get("type") == "olm.maxOpenShiftVersion":
+                                max_ver = prop.get("value")
+                                break
+                    except:
+                        pass
+
+            if max_ver:
+                try:
+                    max_float = float(max_ver)
+                    if target_ocp_float > max_float:
+                        issue = {
+                            "operator": csv_name,
+                            "installed_version": "OLM Dynamic Check",
+                            "target_ocp_version": target_ocp_minor,
+                            "compatible": False,
+                            "recommended_operator_version": f"A version declaring compatibility higher than {max_ver}"
+                        }
+                        self.report_data["operator_compatibility_issues"].append(issue)
+                        self.report_data["overall_status"] = "FAIL"
+                        self.report_data["errors"].append(
+                            f"Dynamic Blocker: Operator '{csv_name}' restricts OCP upgrades past version {max_ver} (olm.maxOpenShiftVersion). "
+                            f"Recommendation: Upgrade this operator before cluster upgrade."
+                        )
+                        continue  # Skip static check if dynamic check failed
+                except ValueError:
+                    pass
+
+            # --- DYNAMIC CHECK 2: Static Mapping Fallback (For ACM, GitOps, ODF) ---
+            package_name = None
+            version_str = None
+            for key in self.COMPATIBILITY_MATRICES.keys():
+                if key in csv_name:
+                    package_name = key
+                    ver_match = re.search(r"v?(\d+\.\d+)", csv_name)
+                    if ver_match:
+                        version_str = ver_match.group(1)
+                    break
+            
+            if package_name and version_str:
+                matrix = self.COMPATIBILITY_MATRICES[package_name]
+                compatible_ocp_versions = matrix.get(version_str, [])
+                if target_ocp_minor not in compatible_ocp_versions:
+                    recommended_version = "Unknown"
+                    for op_ver, ocp_vers in matrix.items():
+                        if target_ocp_minor in ocp_vers:
+                            recommended_version = op_ver
+                            break
+                            
+                    issue = {
+                        "operator": package_name,
+                        "installed_csv": csv_name,
+                        "installed_version": version_str,
+                        "target_ocp_version": target_ocp_minor,
+                        "compatible": False,
+                        "recommended_operator_version": recommended_version
+                    }
+                    # Prevent duplicate errors for same operator
+                    if not any(iss["operator"] == package_name for iss in self.report_data["operator_compatibility_issues"]):
+                        self.report_data["operator_compatibility_issues"].append(issue)
+                        self.report_data["overall_status"] = "FAIL"
+                        self.report_data["errors"].append(
+                            f"Matrix Blocker: {package_name} v{version_str} is incompatible with target OCP {target_ocp_minor}. "
+                            f"Recommendation: Upgrade {package_name} to version {recommended_version} prior to OCP upgrade."
+                        )
+
     def analyze_deprecated_apis(self):
         if self.is_must_gather:
-            # Search inside must-gather clusterversion or apirequestcounts yaml
             return
         path = f"{self.output_dir}/apirequest-removedInRelease_count.out"
         if os.path.exists(path):
@@ -482,14 +624,12 @@ class OpenShiftUpgradePlanner:
                             pass
 
     def run_known_issues_analysis(self):
-        # Look for target version path jumps
         try:
             v_path = os.path.join(self.output_dir, "cluster-scoped-resources", "config.openshift.io", "clusterversions", "cluster.yaml")
             if not os.path.exists(v_path):
                 v_path = os.path.join(self.output_dir, "cluster-scoped-resources", "clusterversion.yaml")
             data = self.load_yaml(v_path)
             if data:
-                # Find current version
                 history = data.get("status", {}).get("history", [])
                 if history:
                     self.report_data["current_version"] = history[0].get("version", "Unknown")
@@ -513,7 +653,19 @@ Execution Mode: `{self.report_data["mode"].upper()}` (Must-gather structure: `{s
 
 ## Must-Gather Analysis Report
 
-### 1. Core Cluster Operators Status
+### 1. Add-on Operator Compatibility Matrix Checks
+The planner cross-referenced your OLM operators against OpenShift target version compatibility matrices (including dynamic checks for OLM `olm.maxOpenShiftVersion` boundaries):
+"""
+        if self.report_data["operator_compatibility_issues"]:
+            md += "| Operator / CSV | Installed Version | Target OCP | Compatibility | Recommendation |\n|---|---|---|---|---|\n"
+            for issue in self.report_data["operator_compatibility_issues"]:
+                md += f"| `{issue['operator']}` | `{issue['installed_version']}` | `{issue['target_ocp_version']}` | 🔴 Incompatible | {issue['recommended_operator_version']} before cluster upgrade |\n"
+        else:
+            md += "*All detected addon operators are compatible with the target version.*"
+
+        md += """
+
+### 2. Core Cluster Operators Status
 | Operator Name | Available | Progressing | Degraded | Status |
 |---|---|---|---|---|
 """
@@ -522,7 +674,7 @@ Execution Mode: `{self.report_data["mode"].upper()}` (Must-gather structure: `{s
             md += f"| `{co['name']}` | `{co['available']}` | `{co['progressing']}` | `{co['degraded']}` | {co_status} |\n"
             
         md += """
-### 2. Machine Config Pools (MCPs)
+### 3. Machine Config Pools (MCPs)
 | MCP Name | Paused | Degraded | Status |
 |---|---|---|---|
 """
@@ -531,7 +683,7 @@ Execution Mode: `{self.report_data["mode"].upper()}` (Must-gather structure: `{s
             md += f"| `{mcp['name']}` | `{mcp['paused']}` | `{mcp['degraded']}` | {mcp_status} |\n"
 
         md += """
-### 3. Node Health
+### 4. Node Health
 | Node Name | Role | Ready | Schedulable |
 |---|---|---|---|
 """
@@ -539,7 +691,7 @@ Execution Mode: `{self.report_data["mode"].upper()}` (Must-gather structure: `{s
             md += f"| `{node['name']}` | `{node['role']}` | `{node['ready']}` | `{not node['unschedulable']}` |\n"
 
         md += """
-### 4. Pod Failures & Evictions
+### 5. Pod Failures & Evictions
 """
         if self.report_data["unhealthy_pods"]:
             md += "| Namespace | Pod Name | Status |\n|---|---|---|\n"
@@ -573,6 +725,7 @@ Execution Mode: `{self.report_data["mode"].upper()}` (Must-gather structure: `{s
         self.analyze_machine_config_pools()
         self.analyze_nodes()
         self.analyze_pods()
+        self.analyze_addon_operators()
         self.analyze_deprecated_apis()
         self.analyze_certificates()
         self.run_known_issues_analysis()
