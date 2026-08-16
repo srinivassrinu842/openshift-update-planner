@@ -184,14 +184,41 @@ oc get csv -A
 ```
 * **Expected Status:** All CSVs must be in the `Succeeded` phase. Any operator in `Failed` or `Replacing` state must be resolved.
 
-### 5.2 Validate Version Compatibility
-Cross-reference the compatibility of critical Red Hat and third-party operators:
-* **OpenShift Data Foundation (ODF)**
-* **OpenShift Virtualization**
-* **Advanced Cluster Management (ACM)**
-* **Red Hat OpenShift GitOps / Pipelines**
+### 5.2 Validate Version Compatibility & Reference Matrix
+When planning the upgrade, cross-reference the OLM CSV versions against the target OpenShift Container Platform (OCP) minor version. Below is the standard product-grade compatibility mapping:
 
-Refer to the official Red Hat Operator Compatibility Matrix to ensure the installed operator versions support the destination OCP minor version. Update operators *before* the cluster upgrade if required by the compatibility matrix.
+#### 1. Red Hat OpenShift Data Foundation (ODF) Compatibility
+* **ODF v4.12** $\rightarrow$ Compatible with **OCP 4.12**
+* **ODF v4.13** $\rightarrow$ Compatible with **OCP 4.13**
+* **ODF v4.14** $\rightarrow$ Compatible with **OCP 4.14**
+* **ODF v4.15** $\rightarrow$ Compatible with **OCP 4.15**
+* **ODF v4.16** $\rightarrow$ Compatible with **OCP 4.16**
+* **ODF v4.17** $\rightarrow$ Compatible with **OCP 4.17**
+* **ODF v4.18** $\rightarrow$ Compatible with **OCP 4.18**
+
+#### 2. OpenShift Virtualization (CNV) Compatibility
+* **CNV v4.12** $\rightarrow$ Compatible with **OCP 4.12**
+* **CNV v4.13** $\rightarrow$ Compatible with **OCP 4.13**
+* **CNV v4.14** $\rightarrow$ Compatible with **OCP 4.14**
+* **CNV v4.15** $\rightarrow$ Compatible with **OCP 4.15**
+* **CNV v4.16** $\rightarrow$ Compatible with **OCP 4.16**
+
+#### 3. Advanced Cluster Management (ACM) Compatibility
+* **ACM v2.8** $\rightarrow$ Compatible with **OCP 4.11, 4.12, 4.13**
+* **ACM v2.9** $\rightarrow$ Compatible with **OCP 4.12, 4.13, 4.14**
+* **ACM v2.10** $\rightarrow$ Compatible with **OCP 4.13, 4.14, 4.15**
+* **ACM v2.11** $\rightarrow$ Compatible with **OCP 4.14, 4.15, 4.16**
+* **ACM v2.12** $\rightarrow$ Compatible with **OCP 4.15, 4.16, 4.17**
+
+#### 4. OpenShift GitOps Compatibility (ArgoCD)
+* **GitOps v1.9** $\rightarrow$ Compatible with **OCP 4.12, 4.13**
+* **GitOps v1.10** $\rightarrow$ Compatible with **OCP 4.13, 4.14**
+* **GitOps v1.11** $\rightarrow$ Compatible with **OCP 4.14, 4.15**
+* **GitOps v1.12** $\rightarrow$ Compatible with **OCP 4.15, 4.16**
+* **GitOps v1.13** $\rightarrow$ Compatible with **OCP 4.16, 4.17**
+
+> [!IMPORTANT]
+> **Operator Update Order:** If an installed operator is incompatible with your target OCP minor version, you must **upgrade the operator first** (using the appropriate subscription channels) before upgrading the OCP cluster. Refer to the Red Hat Customer Portal Interoperability Checker for the most up-to-date mappings.
 
 ---
 
